@@ -58,6 +58,7 @@ public class StringDataBox extends DataBox {
         return this.s;
     }
 
+
     @Override
     public boolean equals(Object o) {
         if (this == o) return true;
