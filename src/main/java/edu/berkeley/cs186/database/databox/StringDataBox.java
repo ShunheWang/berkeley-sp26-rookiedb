@@ -53,6 +53,9 @@ public class StringDataBox extends DataBox {
         return s.getBytes(Charset.forName("ascii"));
     }
 
+
+
+
     @Override
     public String toString() {
         return this.s;
