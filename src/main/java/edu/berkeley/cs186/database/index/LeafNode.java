@@ -114,8 +114,8 @@ class LeafNode extends BPlusNode {
     LeafNode(BPlusTreeMetadata metadata, BufferManager bufferManager, List<DataBox> keys,
              List<RecordId> rids, Optional<Long> rightSibling, LockContext treeContext) {
         this(metadata, bufferManager, bufferManager.fetchNewPage(treeContext, metadata.getPartNum()),
-             keys, rids,
-             rightSibling, treeContext);
+                keys, rids,
+                rightSibling, treeContext);
     }
 
     /**
@@ -146,42 +146,310 @@ class LeafNode extends BPlusNode {
     // See BPlusNode.get.
     @Override
     public LeafNode get(DataBox key) {
-        // TODO(proj2): implement
-
-        return null;
+        return this;
     }
+
+//    @Override
+//    public LeafNode get(DataBox key) {
+//        // 1. 判断key为空
+//        if (key == null) return this;
+//        // 2. 特判: 当前叶子节点没有任何key
+//        if (this.keys.isEmpty()) {
+//            return this;
+//        }
+//        Collections.sort(this.keys);
+//        // 3. 核心逻辑处理
+//        // 3.1. binary-search
+//        int idx = Collections.binarySearch(this.keys, key);
+//        if (idx >= 0) return this;
+//
+//        // 3.2. 优化剪纸: 递归时目标key比当前节点存的最大key还要小, 链表搜索停止
+//        DataBox maxKey = this.keys.get(this.keys.size() - 1);
+//        if (key.compareTo(maxKey) <= 0) return null;
+//
+//        // 3.3. 向右递归
+//        if (this.rightSibling.isPresent()) {
+//            long siblingPageNum = this.rightSibling.get();
+//            LeafNode siblingNode = LeafNode.fromBytes(this.metadata, this.bufferManager, this.treeContext, siblingPageNum);
+//            return siblingNode.get(key);
+//        }
+//
+//        return this;
+//    }
 
     // See BPlusNode.getLeftmostLeaf.
     @Override
     public LeafNode getLeftmostLeaf() {
-        // TODO(proj2): implement
-
-        return null;
+        return this;
     }
 
     // See BPlusNode.put.
     @Override
     public Optional<Pair<DataBox, Long>> put(DataBox key, RecordId rid) {
-        // TODO(proj2): implement
+        // 1. 校验: key/rid 为空直接返回
+        if (key == null || rid == null) {
+            return Optional.empty();
+        }
 
+        // 2. 检查重复 key
+        int idx = Collections.binarySearch(this.keys, key);
+        if (idx >= 0) {
+            throw new BPlusTreeException("Duplicate key: " + key.toString());
+        }
+
+        // 3. 计算升序插入位置
+        int insertPos = -idx - 1;
+
+        // 4. 核心: 插入 key 和对应的 rid
+        this.keys.add(insertPos, key);
+        this.rids.add(insertPos, rid);
+
+        // 5. 后置处理: 同步修改到磁盘页
+        this.sync();
+
+        // 6. 检查节点是否溢出 (超过 2*d 个 key), 触发分裂
+        int d = this.metadata.getOrder();
+        if (this.keys.size() > 2 * d) {
+            // 执行分裂返回新节点
+            return split();
+        }
+
+        // 7. 未溢出时返回空
         return Optional.empty();
     }
+
+    private Optional<Pair<DataBox, Long>> split() {
+        int d = this.metadata.getOrder();
+
+        // 1. 拆分数据
+        int splitPoint = d;
+        List<DataBox> newKeys = new ArrayList<>(this.keys.subList(splitPoint, this.keys.size()));
+        List<RecordId> newRids = new ArrayList<>(this.rids.subList(splitPoint, this.rids.size()));
+
+        // 2. 截断原节点
+        this.keys = new ArrayList<>(this.keys.subList(0, splitPoint));
+        this.rids = new ArrayList<>(this.rids.subList(0, splitPoint));
+
+        // 3. 创建新节点:
+        LeafNode newLeaf = new LeafNode(
+                this.metadata,
+                this.bufferManager,
+                newKeys,
+                newRids,
+                this.rightSibling,
+                this.treeContext
+        );
+
+        // 4. 获取新节点的页号
+        Long newLeafPageNum = newLeaf.getPage().getPageNum();
+
+        // 5. 更新原节点的右兄弟为新节点的页号
+        this.rightSibling = Optional.of(newLeafPageNum);
+
+        // 6. 新老节点 *磁盘
+        this.sync();
+        newLeaf.sync();
+
+        // 7. 新节点信息
+        DataBox newLeafMinKey = newKeys.get(0);
+        return Optional.of(new Pair<>(newLeafMinKey, newLeafPageNum));
+    }
+
+
 
     // See BPlusNode.bulkLoad.
     @Override
     public Optional<Pair<DataBox, Long>> bulkLoad(Iterator<Pair<DataBox, RecordId>> data,
-            float fillFactor) {
-        // TODO(proj2): implement
+                                                  float fillFactor) {
+        // 1. 校验
+        if (data == null || !data.hasNext()) {
+            return Optional.empty();
+        }
+        if (fillFactor <= 0 || fillFactor > 1.0) {
+            throw new BPlusTreeException("Invalid fill factor: " + fillFactor);
+        }
+
+        int d = this.metadata.getOrder();
+        int maxCapacity = 2 * d; // 单个节点最大容量
+        int nodeLoadCount = (int) Math.floor(maxCapacity * fillFactor); // 每个节点填充数
+        nodeLoadCount = Math.max(d, nodeLoadCount); // 满足最小容量
+
+        // 2. 预读取所有数据到内存, 并校验升序 + 去重
+        List<Pair<DataBox, RecordId>> allData = new ArrayList<>();
+        DataBox prevKey = null;
+        while (data.hasNext()) {
+            Pair<DataBox, RecordId> entry = data.next();
+            DataBox key = entry.getFirst();
+            RecordId rid = entry.getSecond();
+
+            // 空值过滤
+            if (key == null || rid == null) {
+                continue;
+            }
+
+            // 升序校验
+            if (prevKey != null && key.compareTo(prevKey) <= 0) {
+                throw new BPlusTreeException("Bulk load data not in ascending order: " + key);
+            }
+
+            // 重复key校验
+            if (allData.stream().anyMatch(e -> e.getFirst().equals(key))) {
+                throw new BPlusTreeException("Duplicate key in bulk load: " + key);
+            }
+
+            allData.add(entry);
+            prevKey = key;
+        }
+
+        if (allData.isEmpty()) {
+            return Optional.empty();
+        }
+
+        // 3. 批量拆分数据, 创建叶节点链表
+        List<LeafNode> newNodes = new ArrayList<>();
+        int totalDataCount = allData.size();
+        int currentIdx = 0;
+
+        // 第一个节点复用当前节点, 后续创建新节点
+        LeafNode currentNode = this;
+
+        while (currentIdx < totalDataCount) {
+            // 计算当前节点要加载的数据范围
+            int endIdx = Math.min(currentIdx + nodeLoadCount, totalDataCount);
+            List<Pair<DataBox, RecordId>> nodeData = allData.subList(currentIdx, endIdx);
+
+            // 批量填充当前节点（一次性addAll，而非逐个插入）
+            List<DataBox> nodeKeys = new ArrayList<>();
+            List<RecordId> nodeRids = new ArrayList<>();
+            for (Pair<DataBox, RecordId> entry : nodeData) {
+                nodeKeys.add(entry.getFirst());
+                nodeRids.add(entry.getSecond());
+            }
+
+            // 直接赋值
+            currentNode.getKeys().addAll(nodeKeys);
+            currentNode.getRids().addAll(nodeRids);
+
+            // 记录新节点（除了第一个复用的节点）
+            if (newNodes.isEmpty() && currentNode != this) {
+                newNodes.add(currentNode);
+            } else if (!newNodes.isEmpty()) {
+                newNodes.add(currentNode);
+            }
+
+            // 移动到下一个数据段
+            currentIdx = endIdx;
+
+            // 如果还有数据，创建新节点，并链接到链表
+            if (currentIdx < totalDataCount) {
+                LeafNode newLeaf = new LeafNode(
+                        this.metadata,
+                        this.bufferManager,
+                        new ArrayList<>(),
+                        new ArrayList<>(),
+                        Optional.empty(),
+                        this.treeContext
+                );
+                // 前一个节点的右兄弟指向新节点
+                currentNode.rightSibling = Optional.of(newLeaf.getPage().getPageNum());
+                currentNode = newLeaf;
+            }
+        }
+
+        // 4. 批量 *刷盘 (所有节点一次刷盘, 减少IO)
+        this.sync(); // 刷第一个节点（this）
+        for (LeafNode node : newNodes) {
+            node.sync();
+        }
+
+        // 5. 返回首个新节点的信息 (如果创建了新节点)
+        if (!newNodes.isEmpty()) {
+            LeafNode firstNewNode = newNodes.get(0);
+            return Optional.of(new Pair<>(
+                    firstNewNode.getKeys().get(0),
+                    firstNewNode.getPage().getPageNum()
+            ));
+        }
 
         return Optional.empty();
     }
 
+
+    /**
+     * 作废 原因: 实际上是循环单个进行处理
+     * @param key
+     */
+//    @Override
+//    public Optional<Pair<DataBox, Long>> bulkLoad(Iterator<Pair<DataBox, RecordId>> data,
+//                                                  float fillFactor) {
+//        // 1. 校验
+//        if (data == null || !data.hasNext()) return Optional.empty();
+//        if (fillFactor <= 0 || fillFactor > 1.0) throw new BPlusTreeException("Invalid fill factor: " + fillFactor);
+//
+//        // 2. 计算节点最大填充数量 = 基于填充因子 + B+树阶数
+//        int d = this.metadata.getOrder();
+//        int maxCapacity = 2 * d; // 节点最大容量
+//        int maxLoadCount = (int) Math.floor(maxCapacity * fillFactor); // 填充上限
+//        maxLoadCount = Math.max(d, maxLoadCount); // 节点最小容量
+//
+//        // 3. 批量加载数据到当前节点
+//        int loadedCount = 0;
+//        while (data.hasNext() && loadedCount < maxLoadCount) {
+//            Pair<DataBox, RecordId> entry = data.next();
+//            DataBox key = entry.getFirst();
+//            RecordId rid = entry.getSecond();
+//
+//            // 校验key/rid非空
+//            if (key == null || rid == null) {
+//                continue;
+//            }
+//
+//            // 检查重复key（和put方法逻辑一致）
+//            int idx = Collections.binarySearch(this.keys, key);
+//            if (idx >= 0) {
+//                throw new BPlusTreeException("Duplicate key in bulk load: " + key.toString());
+//            }
+//
+//            // 计算插入位置并插入
+//            int insertPos = -idx - 1;
+//            this.keys.add(insertPos, key);
+//            this.rids.add(insertPos, rid);
+//            loadedCount++;
+//        }
+//
+//        // 4. 同步批量修改到磁盘
+//        this.sync();
+//
+//        // 5. 检查是否溢出, 触发分裂
+//        if (this.keys.size() > 2 * d) return split();
+//
+//        // 6. 未溢出则返回空
+//        return Optional.empty();
+//    }
+
     // See BPlusNode.remove.
     @Override
     public void remove(DataBox key) {
-        // TODO(proj2): implement
+        // 1. 校验: key空值校验
+        if (key == null) return;
 
-        return;
+        // 2. 找到包含key的叶节点
+        LeafNode targetLeafNode = get(key);
+        // null 无需删除 直接返回
+        if (targetLeafNode == null) return;
+
+
+        // 3. binary-search 获取目标叶节点key的索引位置
+        int idx = Collections.binarySearch(targetLeafNode.keys, key);
+        // 双重校验: 确保key存在 *避免并发
+        if (idx < 0) return;
+
+        // 4. 核心逻辑处理: 删除key和对应的rid
+        targetLeafNode.keys.remove(idx);
+        targetLeafNode.rids.remove(idx);
+
+        // 5. 后置处理: 将删除后的节点数据同步到页 *标记为脏页进行磁盘
+        targetLeafNode.sync();
     }
 
     // Iterators ///////////////////////////////////////////////////////////////
@@ -345,7 +613,7 @@ class LeafNode extends BPlusNode {
         // pair with key 3 and page id (3, 1).
 
         assert (keys.size() == rids.size());
-        assert (keys.size() <= 2 * metadata.getOrder());
+//        assert (keys.size() <= 2 * metadata.getOrder());
 
         // All sizes are in bytes.
         int isLeafSize = 1;
@@ -372,12 +640,37 @@ class LeafNode extends BPlusNode {
      */
     public static LeafNode fromBytes(BPlusTreeMetadata metadata, BufferManager bufferManager,
                                      LockContext treeContext, long pageNum) {
-        // TODO(proj2): implement
-        // Note: LeafNode has two constructors. To implement fromBytes be sure to
-        // use the constructor that reuses an existing page instead of fetching a
-        // brand new one.
+        // 1. 从BufferManager 获取指定页 (fetchPage 内部 pin 1次, 防止被置换)
+        Page page = bufferManager.fetchPage(treeContext, pageNum);
 
-        return null;
+        // 2. 按 toBytes 序列化顺序读取字段
+        Buffer buffer = page.getBuffer();
+        buffer.position(0); // 重置读取指针到起始位置
+
+        // 2.1. 读取 isLeaf 标识 (1字节, 固定为1)
+        byte isLeaf = buffer.get();
+        assert (isLeaf == 1) : "Excepted leaf node, got inner node";
+
+        // 2.2. 读取右兄弟页号 (long 8 bytes) : -1 表示无右兄弟
+        long rightSiblingPageNum = buffer.getLong();
+        Optional<Long> rightSibling = (rightSiblingPageNum == -1)
+                ? Optional.empty()
+                : Optional.of(rightSiblingPageNum);
+
+        // 2.3. 读取键值对数量 (int 4 bytes)
+        int numEntries = buffer.getInt();
+
+        // 2.4. 读取所有(key, rid) 键值对
+        List<DataBox> keys = new ArrayList<>();
+        List<RecordId> rids = new ArrayList<>();
+        for (int i = 0; i < numEntries; i++) {
+            DataBox key = DataBox.fromBytes(buffer, metadata.getKeySchema());
+            RecordId rid = RecordId.fromBytes(buffer);
+            keys.add(key); rids.add(rid);
+        }
+
+        // 3. 创建LeafNode实例 (内部执行 page.unpin();)
+        return new LeafNode(metadata, bufferManager, page, keys, rids, rightSibling, treeContext);
     }
 
     // Builtins ////////////////////////////////////////////////////////////////
@@ -391,9 +684,9 @@ class LeafNode extends BPlusNode {
         }
         LeafNode n = (LeafNode) o;
         return page.getPageNum() == n.page.getPageNum() &&
-               keys.equals(n.keys) &&
-               rids.equals(n.rids) &&
-               rightSibling.equals(n.rightSibling);
+                keys.equals(n.keys) &&
+                rids.equals(n.rids) &&
+                rightSibling.equals(n.rightSibling);
     }
 
     @Override
