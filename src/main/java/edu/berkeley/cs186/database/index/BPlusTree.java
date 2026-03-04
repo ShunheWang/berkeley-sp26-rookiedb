@@ -145,9 +145,8 @@ public class BPlusTree {
         // TODO(proj4_integration): Update the following line
         LockUtil.ensureSufficientLockHeld(lockContext, LockType.NL);
 
-        // TODO(proj2): implement
-
-        return Optional.empty();
+        LeafNode leafNode = root.get(key);
+        return leafNode.getKey(key);
     }
 
     /**
@@ -200,10 +199,8 @@ public class BPlusTree {
     public Iterator<RecordId> scanAll() {
         // TODO(proj4_integration): Update the following line
         LockUtil.ensureSufficientLockHeld(lockContext, LockType.NL);
-
-        // TODO(proj2): Return a BPlusTreeIterator.
-
-        return Collections.emptyIterator();
+        LeafNode leafNode = root.getLeftmostLeaf();
+        return new BPlusTreeIterator(leafNode);
     }
 
     /**
@@ -234,9 +231,10 @@ public class BPlusTree {
         // TODO(proj4_integration): Update the following line
         LockUtil.ensureSufficientLockHeld(lockContext, LockType.NL);
 
-        // TODO(proj2): Return a BPlusTreeIterator.
+        LeafNode startLeaf = root.get(key);
+        if (startLeaf == null || startLeaf.getKeys().isEmpty()) return java.util.Collections.emptyIterator();
 
-        return Collections.emptyIterator();
+        return new BPlusTreeIterator(startLeaf, key);
     }
 
     /**
@@ -253,12 +251,17 @@ public class BPlusTree {
         // TODO(proj4_integration): Update the following line
         LockUtil.ensureSufficientLockHeld(lockContext, LockType.NL);
 
-        // TODO(proj2): implement
-        // Note: You should NOT update the root variable directly.
-        // Use the provided updateRoot() helper method to change
-        // the tree's root if the old root splits.
+        Optional<Pair<DataBox, Long>> splitPair = root.put(key, rid);
+        if (splitPair.isPresent()){
+            List<DataBox> newKeys = new ArrayList<DataBox>();
+            List<Long> newChildren = new ArrayList<Long>();
+            newKeys.add(splitPair.get().getFirst());
+            newChildren.add(root.getPage().getPageNum());
+            newChildren.add(splitPair.get().getSecond());
+            InnerNode newRoot = new InnerNode(metadata, bufferManager, newKeys, newChildren, lockContext);
+            updateRoot(newRoot);
+        }
 
-        return;
     }
 
     /**
@@ -270,11 +273,11 @@ public class BPlusTree {
      * be filled up to full and split in half exactly like in put.
      *
      * This method should raise an exception if the tree is not empty at time
-     * of bulk loading. Bulk loading is used when creating a new Index, so think 
-     * about what an "empty" tree should look like. If data does not meet the 
-     * preconditions (contains duplicates or not in order), the resulting 
-     * behavior is undefined. Undefined behavior means you can handle these 
-     * cases however you want (or not at all) and you are not required to 
+     * of bulk loading. Bulk loading is used when creating a new Index, so think
+     * about what an "empty" tree should look like. If data does not meet the
+     * preconditions (contains duplicates or not in order), the resulting
+     * behavior is undefined. Undefined behavior means you can handle these
+     * cases however you want (or not at all) and you are not required to
      * write any explicit checks.
      *
      * The behavior of this method should be similar to that of InnerNode's
@@ -284,12 +287,33 @@ public class BPlusTree {
         // TODO(proj4_integration): Update the following line
         LockUtil.ensureSufficientLockHeld(lockContext, LockType.NL);
 
-        // TODO(proj2): implement
-        // Note: You should NOT update the root variable directly.
-        // Use the provided updateRoot() helper method to change
-        // the tree's root if the old root splits.
+        // 3. 核心处理：只在根节点需要分裂时处理，且避免重复分裂
+        Optional<Pair<DataBox, Long>> splitPair;
+        while (data.hasNext()) {
+            splitPair = root.bulkLoad(data, fillFactor);
+            // 只有当分裂存在，且当前根不是内部节点（或内部节点未填满）时才创建新根
+            if (splitPair.isPresent()) {
+                DataBox splitKey = splitPair.get().getFirst();
+                long newChildPageNum = splitPair.get().getSecond();
 
-        return;
+                // 避免重复创建根：如果当前根已经包含该分裂键，跳过
+                if (root instanceof InnerNode) {
+                    InnerNode innerRoot = (InnerNode) root;
+                    if (innerRoot.getKeys().contains(splitKey)) {
+                        continue;
+                    }
+                }
+
+                List<DataBox> newRootKeys = new ArrayList<>();
+                List<Long> newRootChildren = new ArrayList<>();
+                newRootKeys.add(splitKey);
+                newRootChildren.add(root.getPage().getPageNum());
+                newRootChildren.add(newChildPageNum);
+
+                InnerNode newRoot = new InnerNode(metadata, bufferManager, newRootKeys, newRootChildren, lockContext);
+                updateRoot(newRoot);
+            }
+        }
     }
 
     /**
@@ -308,8 +332,8 @@ public class BPlusTree {
         // TODO(proj4_integration): Update the following line
         LockUtil.ensureSufficientLockHeld(lockContext, LockType.NL);
 
-        // TODO(proj2): implement
-
+        LeafNode leafNode = root.get(key);
+        leafNode.remove(key);
         return;
     }
 
@@ -422,20 +446,84 @@ public class BPlusTree {
 
     // Iterator ////////////////////////////////////////////////////////////////
     private class BPlusTreeIterator implements Iterator<RecordId> {
-        // TODO(proj2): Add whatever fields and constructors you want here.
+        // 当前遍历的叶子节点 *懒加载, 用完丢弃, 不缓存
+        private LeafNode currentLeafNode;
+        // 当前叶子节点的rids迭代器
+        private Iterator<RecordId> currentRidIterator;
+        // 起始key scanGreaterEqual用, scanAll为null
+        private DataBox startKey;
+        // 标记是否已定位到 scanGreaterEqual 的起始位置
+        private boolean startPosFound;
+
+        /**
+         * 构造器: 从最左叶子节点开始，懒加载遍历所有叶子节点
+         * 核心: 不预加载任何RecordId到内存, 只在hasNext/next时按需获取
+         */
+        public BPlusTreeIterator(LeafNode startLeaf) {
+            this.currentLeafNode = startLeaf;
+            // 初始化当前叶子节点的迭代器
+            this.currentRidIterator = startLeaf.getRids().iterator();
+            this.startKey = null;
+            this.startPosFound = true;
+        }
+
+        /**
+         * 构造器2: 适配scanGreaterEqual, 从≥key的位置开始遍历
+         */
+        public BPlusTreeIterator(LeafNode startLeaf, DataBox startKey) {
+            this.currentLeafNode = startLeaf;
+            this.startKey = startKey;
+            this.startPosFound = false;
+            findStartPosition(); // 处理起始指针逻辑
+        }
+
+        // 定位scanGreaterEqual的起始位置（懒加载，仅找索引，不拷贝数据）
+        private void findStartPosition() {
+            // 特判
+            if (currentLeafNode == null) {
+                this.currentRidIterator = java.util.Collections.emptyIterator();
+                this.startPosFound = true;
+                return;
+            }
+            int startIdx = InnerNode.numLessThan(startKey, currentLeafNode.getKeys());
+            this.currentRidIterator = currentLeafNode.getRids().subList(startIdx, currentLeafNode.getRids().size()).iterator();
+            this.startPosFound = true;
+        }
+
+
 
         @Override
         public boolean hasNext() {
-            // TODO(proj2): implement
+            if (!startPosFound) return false;
+            // 1. 当前叶子节点还有未遍历的RecordId 则返回true
+            if (currentRidIterator.hasNext()) {
+                return true;
+            }
 
+            // 2. 当前叶子节点遍历完, 找下一个右兄弟节点 懒加载下一个节点
+            Optional<LeafNode> rightSibling = currentLeafNode.getRightSibling();
+            // 由于节点内部数据是自增incr且compact, 因此可以通过第一个在判断节点有没有值;
+            while (rightSibling.isPresent()) {
+                currentLeafNode = rightSibling.get();
+                currentRidIterator = currentLeafNode.getRids().iterator();
+
+                // 新节点有数据 返回true, 停止找下一个
+                if (currentRidIterator.hasNext()) return true;
+
+                // 新节点也空, 继续找下一个右兄弟
+                rightSibling = currentLeafNode.getRightSibling();
+            }
+
+            // 3. 所有叶子节点都遍历完
             return false;
         }
 
         @Override
         public RecordId next() {
-            // TODO(proj2): implement
-
-            throw new NoSuchElementException();
+            // 先检查是否有下一个元素
+            if (!hasNext()) throw new NoSuchElementException("No more RecordIds in B+ tree");
+            // 仅返回当前迭代器的下一个元素 *懒加载
+            return currentRidIterator.next();
         }
     }
 }

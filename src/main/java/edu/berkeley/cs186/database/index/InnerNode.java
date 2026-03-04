@@ -80,159 +80,96 @@ class InnerNode extends BPlusNode {
     // See BPlusNode.get.
     @Override
     public LeafNode get(DataBox key) {
-        // 1. 获取key所在的子节点的位置
-        int childPtr = numLessThanEqual(key, keys);
-
-        // 2. 根据子节点指针获取key
-        BPlusNode nextNode = getChild(childPtr);
-
-        // 3. 递归: 调用子节点
-        return nextNode.get(key);
+        int index = numLessThanEqual(key, keys);
+        BPlusNode childNode = getChild(index);
+        return childNode.get(key);
     }
+
+
 
     // See BPlusNode.getLeftmostLeaf.
     @Override
     public LeafNode getLeftmostLeaf() {
         assert(children.size() > 0);
-        // 1. 直接取第一个子节点，避免重复调用getChildren()
-        BPlusNode currChild = getChild(0);
-
-        // 2. 终止条件：如果是leafNode 则返回
-        if (currChild instanceof LeafNode) return (LeafNode) currChild;
-
-        // 3. innerNode 则继续递归
-        return currChild.getLeftmostLeaf();
+        BPlusNode LeftNode = getChild(0);
+        return LeftNode.getLeftmostLeaf();
     }
 
     // See BPlusNode.put.
     @Override
     public Optional<Pair<DataBox, Long>> put(DataBox key, RecordId rid) {
-        // 1. 空校验
-        if (key == null || rid == null) throw new IllegalArgumentException("Key/RecordId cannot be null");
-
-        if (keys == null || children == null || children.isEmpty()) throw new IllegalStateException("InnerNode has no children");
-
-        // 2. 获取key对应子节点位置
-        int index = numLessThanEqual(key, keys);
-        BPlusNode child = getChild(index);
-        // 3. 递归调用子节点put (btw, 到达leafNode 调用的实际上是leafNode 的put而不是innerNode 中的put)
-        Optional<Pair<DataBox, Long>> pair = child.put(key, rid);
-
-        // 4. 获取[d, 2d]
-        int order = metadata.getOrder();
-        int maxSize = order * 2;
-
-        // 5. 子节点未分裂：直接返回空
-        if (!pair.isPresent()) return Optional.empty();
-
-
-        // 6. 子节点分裂：取出分隔键和新子节点页号
-        DataBox newKey = pair.get().getFirst();
-        Long newChildPageId = pair.get().getSecond();
-
-        // 7. 插入分隔键和新子节点（操作类成员变量，避免命名冲突）
-        this.keys.add(index, newKey);
-        this.children.add(index + 1, newChildPageId);
-        // 关键：插入后立即同步 *刷盘
+        boolean splitFlag = false;
+        int insertIndex = numLessThanEqual(key, keys);
+        DataBox splitKey = null;
+        Long splitPageNum = -1L;
+        BPlusNode childNode = getChild(insertIndex);
+        Optional<Pair<DataBox, Long>> splitPair = childNode.put(key, rid);
+        if (splitPair.isPresent()){
+            keys.add(insertIndex, splitPair.get().getFirst());
+            children.add(insertIndex+1, splitPair.get().getSecond());
+            if (keys.size() > metadata.getOrder() * 2){
+                splitFlag = true;
+                int order = metadata.getOrder();
+                List<DataBox> rightKeys = new ArrayList<>(keys.subList(order+1, keys.size()));
+                List<Long> rightChildren = new ArrayList<>(children.subList(order+1, children.size()));
+                splitKey = keys.get(order);
+                keys.subList(order, keys.size()).clear();
+                children.subList(order+1, children.size()).clear();
+                InnerNode rightInnerNode = new InnerNode(metadata, bufferManager, rightKeys, rightChildren,  treeContext);
+                splitPageNum = rightInnerNode.getPage().getPageNum();
+            }
+        }
         sync();
-
-        // 8. 当前节点未超容: 返回空
-        if (this.keys.size() <= maxSize) return Optional.empty();
-
-
-        // 8. 当前节点超容：分裂
-        // 8.1 计算分裂点：中间键的索引（order）
-        int splitPos = order;
-        // 8.2 新节点的键：splitPos+1 到末尾（共order个键）
-        List<DataBox> newNodeKeys = new ArrayList<>(this.keys.subList(splitPos + 1, this.keys.size()));
-        // 8.3 新节点的子节点：splitPos+1 到末尾（共order+1个）
-        List<Long> newNodeChildren = new ArrayList<>(this.children.subList(splitPos + 1, this.children.size()));
-        // 8.4 向上传播的分隔键（中间键）
-        DataBox popUpKey = this.keys.get(splitPos);
-        // 8.5 原节点保留前splitPos个键
-        this.keys = new ArrayList<>(this.keys.subList(0, splitPos));
-        // 8.6 原节点保留前splitPos+1个子节点
-        this.children = new ArrayList<>(this.children.subList(0, splitPos + 1));
-
-        // 8.7 创建新内部节点并同步 *刷盘
-        InnerNode newNode = new InnerNode(metadata, bufferManager, newNodeKeys, newNodeChildren, treeContext);
-        long popUpPageNum = newNode.getPage().getPageNum();
-        newNode.sync(); // 新节点同步
-        this.sync();    // 原节点同步（分裂后的数据）
-
-        // 8. 返回向上传播的分隔键+新节点页号
-        return Optional.of(new Pair<>(popUpKey, popUpPageNum));
+        return splitFlag ? Optional.of(new Pair<DataBox, Long>(splitKey, splitPageNum)): Optional.empty();
     }
+
 
     // See BPlusNode.bulkLoad.
     @Override
-    public Optional<Pair<DataBox, Long>> bulkLoad(Iterator<Pair<DataBox, RecordId>> data,
-                                                  float fillFactor) {
-        // 1. 校验
+    public Optional<Pair<DataBox, Long>> bulkLoad(Iterator<Pair<DataBox, RecordId>> data, float fillFactor) {
         if (data == null) throw new IllegalArgumentException("Data iterator cannot be null");
-        if (fillFactor <= 0 || fillFactor > 1.0) throw new IllegalArgumentException("Fill factor must be in (0, 1]");
-        if (children == null || children.isEmpty()) throw new IllegalStateException("InnerNode has no children for bulk load");
+        if (children == null || children.isEmpty()) {
+            throw new IllegalStateException("InnerNode has no children");
+        }
 
-        // 2. 获取[d, 2d]
-        int order = metadata.getOrder();
-        int maxKeySize = 2 * order;
-        // 3. 批量加载的目标填充数 按fillFactor计算
-        int targetFillSize = (int) Math.floor(maxKeySize * fillFactor);
+        int d = metadata.getOrder();
+        int maxKeySize = 2 * d; // 4
+        Optional<Pair<DataBox, Long>> splitPair = Optional.empty();
 
-        // 4. 缓存最右侧子节点
-        BPlusNode rightMostChild = null;
+        BPlusNode lastChild = getChild(children.size() - 1);
+        while (data.hasNext()) {
+            splitPair = lastChild.bulkLoad(data, fillFactor);
 
-        // 3. 批量填充子节点：直到达到目标填充率 或 数据耗尽
-        while (keys.size() < targetFillSize && data.hasNext()) {
-            // 3.1 获取最右侧子节点（缓存复用，减少磁盘页读取）
-            rightMostChild = getChild(children.size() - 1); // 最右侧子节点索引是children.size()-1（原代码keys.size()等价）
-            // 3.2 递归批量加载子节点
-            Optional<Pair<DataBox, Long>> popUpPair = rightMostChild.bulkLoad(data, fillFactor);
-
-            // 3.3 子节点分裂：插入分隔键和新子节点
-            if (popUpPair.isPresent()) {
-                DataBox splitKey = popUpPair.get().getFirst();
-                Long newChildPageNum = popUpPair.get().getSecond();
-                // 插入到当前节点末尾（批量加载数据有序，末尾插入天然有序，无需排序）
+            // 子节点未分裂也继续加载
+            if (splitPair.isPresent()) {
+                DataBox splitKey = splitPair.get().getFirst();
+                long newChildPageNum = splitPair.get().getSecond();
                 this.keys.add(splitKey);
                 this.children.add(newChildPageNum);
-                // 插入后即时同步，保证数据一致性
-                sync();
+                this.sync();
 
-                // 插入后若超过目标填充率，提前终止循环（避免过度填充）
-                if (this.keys.size() >= targetFillSize) {
-                    break;
+                // 内部节点满了才分裂
+                if (this.keys.size() > maxKeySize) {
+                    int splitPos = d;
+                    DataBox popUpKey = this.keys.get(splitPos);
+
+                    List<DataBox> rightKeys = new ArrayList<>(this.keys.subList(splitPos + 1, this.keys.size()));
+                    List<Long> rightChildren = new ArrayList<>(this.children.subList(splitPos + 1, this.children.size()));
+                    this.keys.subList(splitPos, this.keys.size()).clear();
+                    this.children.subList(splitPos + 1, this.children.size()).clear();
+
+                    InnerNode rightNode = new InnerNode(metadata, bufferManager, rightKeys, rightChildren, treeContext);
+                    rightNode.sync();
+                    this.sync();
+
+                    return Optional.of(new Pair<>(popUpKey, rightNode.getPage().getPageNum()));
                 }
+
+                lastChild = BPlusNode.fromBytes(metadata, bufferManager, treeContext, newChildPageNum);
             }
         }
 
-        // 4. 当前节点未达到分裂阈值：返回空
-        if (this.keys.size() <= maxKeySize) {
-            sync(); // 最终同步一次，确保所有修改落地
-            return Optional.empty();
-        }
-
-        // 5. 当前节点满：分裂（修复命名冲突+边界漏洞）
-        // 5.1 计算分裂点（内部节点分裂规则：中间键向上传播）
-        int splitPos = order;
-        DataBox popUpKey = this.keys.get(splitPos); // 向上传播的分隔键
-
-        // 5.2 新节点的键：splitPos+1 到末尾（共order-1个键）
-        List<DataBox> newNodeKeys = new ArrayList<>(this.keys.subList(splitPos + 1, this.keys.size()));
-        // 5.3 新节点的子节点：splitPos+1 到末尾（共order个）
-        List<Long> newNodeChildren = new ArrayList<>(this.children.subList(splitPos + 1, this.children.size()));
-        // 5.4 原节点保留前splitPos个键和splitPos+1个子节点
-        this.keys = new ArrayList<>(this.keys.subList(0, splitPos));
-        this.children = new ArrayList<>(this.children.subList(0, splitPos + 1));
-
-        // 5.5 创建新节点并同步
-        InnerNode newNode = new InnerNode(metadata, bufferManager, newNodeKeys, newNodeChildren, treeContext);
-        long popUpPageNum = newNode.getPage().getPageNum();
-        newNode.sync(); // 新节点同步到磁盘
-        this.sync();    // 原节点分裂后同步
-
-        // 6. 返回分隔键+新节点页号
-        return Optional.of(new Pair<>(popUpKey, popUpPageNum));
+        return splitPair;
     }
 
     // See BPlusNode.remove.

@@ -186,192 +186,150 @@ class LeafNode extends BPlusNode {
     // See BPlusNode.put.
     @Override
     public Optional<Pair<DataBox, Long>> put(DataBox key, RecordId rid) {
-        // 1. 校验: key/rid 为空直接返回
-        if (key == null || rid == null) {
-            return Optional.empty();
+        boolean splitFlag = false;
+        if (keys.contains(key)){
+            throw new BPlusTreeException("You cannt insert duplicate value.");
         }
-
-        // 2. 检查重复 key
-        int idx = Collections.binarySearch(this.keys, key);
-        if (idx >= 0) {
-            throw new BPlusTreeException("Duplicate key: " + key.toString());
+        int insertIndex = InnerNode.numLessThan(key, keys);
+        DataBox splitKey = null;
+        Long splitPageNum = -1L;
+        keys.add(insertIndex, key);
+        rids.add(insertIndex, rid);
+        if (keys.size() > metadata.getOrder() * 2){
+            splitFlag = true;
+            int order = metadata.getOrder();
+            List<DataBox> rightkeys = new ArrayList<>(keys.subList(order, keys.size()));
+            List<RecordId> rightRids = new ArrayList<>(rids.subList(order, rids.size()));
+            keys.subList(order, keys.size()).clear();
+            rids.subList(order, rids.size()).clear();
+            splitKey = rightkeys.get(0);
+            LeafNode rightLeafNode = new LeafNode(metadata, bufferManager, rightkeys, rightRids, this.rightSibling, treeContext);
+            splitPageNum = rightLeafNode.getPage().getPageNum();
+            rightSibling = Optional.of(splitPageNum);
         }
-
-        // 3. 计算升序插入位置
-        int insertPos = -idx - 1;
-
-        // 4. 核心: 插入 key 和对应的 rid
-        this.keys.add(insertPos, key);
-        this.rids.add(insertPos, rid);
-
-        // 5. 后置处理: 同步修改到磁盘页
-        this.sync();
-
-        // 6. 检查节点是否溢出 (超过 2*d 个 key), 触发分裂
-        int d = this.metadata.getOrder();
-        if (this.keys.size() > 2 * d) {
-            // 执行分裂返回新节点
-            return split();
-        }
-
-        // 7. 未溢出时返回空
-        return Optional.empty();
+        sync();
+        return splitFlag ? Optional.of(new Pair<DataBox, Long>(splitKey, splitPageNum)): Optional.empty();
     }
 
-    private Optional<Pair<DataBox, Long>> split() {
-        int d = this.metadata.getOrder();
-
-        // 1. 拆分数据
-        int splitPoint = d;
-        List<DataBox> newKeys = new ArrayList<>(this.keys.subList(splitPoint, this.keys.size()));
-        List<RecordId> newRids = new ArrayList<>(this.rids.subList(splitPoint, this.rids.size()));
-
-        // 2. 截断原节点
-        this.keys = new ArrayList<>(this.keys.subList(0, splitPoint));
-        this.rids = new ArrayList<>(this.rids.subList(0, splitPoint));
-
-        // 3. 创建新节点:
-        LeafNode newLeaf = new LeafNode(
-                this.metadata,
-                this.bufferManager,
-                newKeys,
-                newRids,
-                this.rightSibling,
-                this.treeContext
-        );
-
-        // 4. 获取新节点的页号
-        Long newLeafPageNum = newLeaf.getPage().getPageNum();
-
-        // 5. 更新原节点的右兄弟为新节点的页号
-        this.rightSibling = Optional.of(newLeafPageNum);
-
-        // 6. 新老节点 *磁盘
-        this.sync();
-        newLeaf.sync();
-
-        // 7. 新节点信息
-        DataBox newLeafMinKey = newKeys.get(0);
-        return Optional.of(new Pair<>(newLeafMinKey, newLeafPageNum));
-    }
+//    private Optional<Pair<DataBox, Long>> split() {
+//        int d = this.metadata.getOrder();
+//        int splitPoint = d; // 阶数1 → splitPoint=1
+//
+//        // 拆分新节点数据
+//        List<DataBox> newKeys = new ArrayList<>(this.keys.subList(splitPoint, this.keys.size()));
+//        List<RecordId> newRids = new ArrayList<>(this.rids.subList(splitPoint, this.rids.size()));
+//
+//        // 截断原节点（保留前d个键）
+//        this.keys = new ArrayList<>(this.keys.subList(0, splitPoint));
+//        this.rids = new ArrayList<>(this.rids.subList(0, splitPoint));
+//
+//        // 创建新叶子节点（继承原节点的右兄弟）
+//        LeafNode newLeaf = new LeafNode(
+//                this.metadata,
+//                this.bufferManager,
+//                newKeys,
+//                newRids,
+//                this.rightSibling,
+//                this.treeContext
+//        );
+//        Long newLeafPageNum = newLeaf.getPage().getPageNum();
+//
+//        // 更新原节点的右兄弟为新节点
+//        this.rightSibling = Optional.of(newLeafPageNum);
+//
+//        // 同步到磁盘
+//        this.sync();
+//        newLeaf.sync();
+//
+//        // 返回新节点的最小键（用于父节点插入）
+//        DataBox newLeafMinKey = newKeys.get(0);
+//        return Optional.of(new Pair<>(newLeafMinKey, newLeafPageNum));
+//    }
 
 
 
     // See BPlusNode.bulkLoad.
     @Override
-    public Optional<Pair<DataBox, Long>> bulkLoad(Iterator<Pair<DataBox, RecordId>> data,
-                                                  float fillFactor) {
-        // 1. 校验
-        if (data == null || !data.hasNext()) {
-            return Optional.empty();
-        }
+    public Optional<Pair<DataBox, Long>> bulkLoad(Iterator<Pair<DataBox, RecordId>> data, float fillFactor) {
+        if (data == null || !data.hasNext()) return Optional.empty();
         if (fillFactor <= 0 || fillFactor > 1.0) {
             throw new BPlusTreeException("Invalid fill factor: " + fillFactor);
         }
 
-        int d = this.metadata.getOrder();
-        int maxCapacity = 2 * d; // 单个节点最大容量
-        int nodeLoadCount = (int) Math.floor(maxCapacity * fillFactor); // 每个节点填充数
-        nodeLoadCount = Math.max(d, nodeLoadCount); // 满足最小容量
-
-        // 2. 预读取所有数据到内存, 并校验升序 + 去重
-        List<Pair<DataBox, RecordId>> allData = new ArrayList<>();
+        int d = metadata.getOrder();
+        int maxCapacity = 2 * d;
+        int nodeLoadCount = Math.max(d, (int) Math.floor(maxCapacity * fillFactor));
         DataBox prevKey = null;
-        while (data.hasNext()) {
+
+        // 填充当前节点到目标数
+        while (data.hasNext() && this.getKeys().size() < nodeLoadCount) {
             Pair<DataBox, RecordId> entry = data.next();
             DataBox key = entry.getFirst();
             RecordId rid = entry.getSecond();
 
-            // 空值过滤
-            if (key == null || rid == null) {
-                continue;
-            }
-
-            // 升序校验
+            if (key == null || rid == null) continue;
             if (prevKey != null && key.compareTo(prevKey) <= 0) {
                 throw new BPlusTreeException("Bulk load data not in ascending order: " + key);
             }
-
-            // 重复key校验
-            if (allData.stream().anyMatch(e -> e.getFirst().equals(key))) {
+            if (Collections.binarySearch(this.getKeys(), key) >= 0) {
                 throw new BPlusTreeException("Duplicate key in bulk load: " + key);
             }
 
-            allData.add(entry);
+            int insertIdx = -(Collections.binarySearch(this.getKeys(), key) + 1);
+            this.getKeys().add(insertIdx, key);
+            this.getRids().add(insertIdx, rid);
             prevKey = key;
         }
 
-        if (allData.isEmpty()) {
+        // 数据加载完，无分裂
+        if (!data.hasNext()) {
+            this.sync();
             return Optional.empty();
         }
 
-        // 3. 批量拆分数据, 创建叶节点链表
-        List<LeafNode> newNodes = new ArrayList<>();
-        int totalDataCount = allData.size();
-        int currentIdx = 0;
+        // 分裂条件：填满就分裂，但只处理有数据的情况
+        if (this.getKeys().size() >= nodeLoadCount) {
+            LeafNode rightNode = new LeafNode(metadata, bufferManager, new ArrayList<>(), new ArrayList<>(), Optional.empty(), treeContext);
+            prevKey = this.getKeys().get(this.getKeys().size() - 1);
 
-        // 第一个节点复用当前节点, 后续创建新节点
-        LeafNode currentNode = this;
+            // 只加载到目标数，不超额
+            int rightCount = 0;
+            while (data.hasNext() && rightCount < nodeLoadCount) {
+                Pair<DataBox, RecordId> entry = data.next();
+                DataBox key = entry.getFirst();
+                RecordId rid = entry.getSecond();
 
-        while (currentIdx < totalDataCount) {
-            // 计算当前节点要加载的数据范围
-            int endIdx = Math.min(currentIdx + nodeLoadCount, totalDataCount);
-            List<Pair<DataBox, RecordId>> nodeData = allData.subList(currentIdx, endIdx);
+                if (key == null || rid == null) continue;
+                if (key.compareTo(prevKey) <= 0) {
+                    throw new BPlusTreeException("Bulk load data not in ascending order: " + key);
+                }
+                if (Collections.binarySearch(rightNode.getKeys(), key) >= 0) {
+                    throw new BPlusTreeException("Duplicate key in bulk load: " + key);
+                }
 
-            // 批量填充当前节点（一次性addAll，而非逐个插入）
-            List<DataBox> nodeKeys = new ArrayList<>();
-            List<RecordId> nodeRids = new ArrayList<>();
-            for (Pair<DataBox, RecordId> entry : nodeData) {
-                nodeKeys.add(entry.getFirst());
-                nodeRids.add(entry.getSecond());
+                int insertIdx = -(Collections.binarySearch(rightNode.getKeys(), key) + 1);
+                rightNode.getKeys().add(insertIdx, key);
+                rightNode.getRids().add(insertIdx, rid);
+                prevKey = key;
+                rightCount++;
             }
 
-            // 直接赋值
-            currentNode.getKeys().addAll(nodeKeys);
-            currentNode.getRids().addAll(nodeRids);
+            // 关联兄弟节点
+            this.rightSibling = Optional.of(rightNode.getPage().getPageNum());
+            this.sync();
+            rightNode.sync();
 
-            // 记录新节点（除了第一个复用的节点）
-            if (newNodes.isEmpty() && currentNode != this) {
-                newNodes.add(currentNode);
-            } else if (!newNodes.isEmpty()) {
-                newNodes.add(currentNode);
+            // 只有新节点有数据时才返回分裂键
+            if (rightNode.getKeys().isEmpty()) {
+                return Optional.empty();
             }
-
-            // 移动到下一个数据段
-            currentIdx = endIdx;
-
-            // 如果还有数据，创建新节点，并链接到链表
-            if (currentIdx < totalDataCount) {
-                LeafNode newLeaf = new LeafNode(
-                        this.metadata,
-                        this.bufferManager,
-                        new ArrayList<>(),
-                        new ArrayList<>(),
-                        Optional.empty(),
-                        this.treeContext
-                );
-                // 前一个节点的右兄弟指向新节点
-                currentNode.rightSibling = Optional.of(newLeaf.getPage().getPageNum());
-                currentNode = newLeaf;
-            }
+            DataBox splitKey = rightNode.getKeys().get(0);
+            long splitPageNum = rightNode.getPage().getPageNum();
+            return Optional.of(new Pair<>(splitKey, splitPageNum));
+        } else {
+            this.sync();
+            return Optional.empty();
         }
-
-        // 4. 批量 *刷盘 (所有节点一次刷盘, 减少IO)
-        this.sync(); // 刷第一个节点（this）
-        for (LeafNode node : newNodes) {
-            node.sync();
-        }
-
-        // 5. 返回首个新节点的信息 (如果创建了新节点)
-        if (!newNodes.isEmpty()) {
-            LeafNode firstNewNode = newNodes.get(0);
-            return Optional.of(new Pair<>(
-                    firstNewNode.getKeys().get(0),
-                    firstNewNode.getPage().getPageNum()
-            ));
-        }
-
-        return Optional.empty();
     }
 
 
@@ -430,26 +388,11 @@ class LeafNode extends BPlusNode {
     // See BPlusNode.remove.
     @Override
     public void remove(DataBox key) {
-        // 1. 校验: key空值校验
-        if (key == null) return;
-
-        // 2. 找到包含key的叶节点
-        LeafNode targetLeafNode = get(key);
-        // null 无需删除 直接返回
-        if (targetLeafNode == null) return;
-
-
-        // 3. binary-search 获取目标叶节点key的索引位置
-        int idx = Collections.binarySearch(targetLeafNode.keys, key);
-        // 双重校验: 确保key存在 *避免并发
-        if (idx < 0) return;
-
-        // 4. 核心逻辑处理: 删除key和对应的rid
-        targetLeafNode.keys.remove(idx);
-        targetLeafNode.rids.remove(idx);
-
-        // 5. 后置处理: 将删除后的节点数据同步到页 *标记为脏页进行磁盘
-        targetLeafNode.sync();
+        int index = keys.indexOf(key);
+        keys.remove(index);
+        rids.remove(index);
+        sync();
+        return;
     }
 
     // Iterators ///////////////////////////////////////////////////////////////
