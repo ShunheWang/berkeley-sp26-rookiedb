@@ -86,8 +86,18 @@ public class SortOperator extends QueryOperator {
      * iterator
      */
     public Run sortRun(Iterator<Record> records) {
-        // TODO(proj3_part1): implement
-        return null;
+        Run run = makeRun();
+        List<Record> recordList = new ArrayList<>();
+        while(records.hasNext()){
+            Record record = records.next();
+            if (record == null) continue;
+            recordList.add(record);
+
+        }
+        recordList.sort(comparator);
+        run.addAll(recordList);
+        return run;
+
     }
 
     /**
@@ -107,8 +117,37 @@ public class SortOperator extends QueryOperator {
      */
     public Run mergeSortedRuns(List<Run> runs) {
         assert (runs.size() <= this.numBuffers - 1);
-        // TODO(proj3_part1): implement
-        return null;
+        Run result = makeRun();
+
+        PriorityQueue<Pair<Record,Integer>> pq = new PriorityQueue<>(runs.size(), new RecordPairComparator());
+
+        List<BacktrackingIterator<Record>> iterators = new ArrayList<>();
+        for(int i = 0; i < runs.size(); i++) {
+            // 1. 把当前输入的runs的迭代器全部放入迭代器list中
+            BacktrackingIterator<Record> it = runs.get(i).iterator();
+            iterators.add(it);
+            // 2. 把每个迭代器的第一个数据, 也就是头数据放入pq
+            if (it.hasNext()) {
+                Record record = it.next();
+                pq.add(new Pair<>(record, i));
+            }
+        }
+
+        while(!pq.isEmpty()){
+            Pair<Record, Integer> pair = pq.poll();
+            // 获取最小数据
+            Record record = pair.getFirst();
+            int runIndex = pair.getSecond();
+
+            result.add(record);
+            // 当前pq中取的最小的数据, 对应的runInterator是哪一个, 并获取这个迭代器的下一个数据
+            BacktrackingIterator<Record> iterator = iterators.get(runIndex);
+            if (iterator.hasNext()) {
+                Record nextRecord = iterator.next();
+                pq.add(new Pair<>(nextRecord, runIndex));
+            }
+        }
+        return result;
     }
 
     /**
@@ -132,8 +171,13 @@ public class SortOperator extends QueryOperator {
      * @return a list of sorted runs obtained by merging the input runs
      */
     public List<Run> mergePass(List<Run> runs) {
-        // TODO(proj3_part1): implement
-        return Collections.emptyList();
+        List<Run> result = new ArrayList<>();
+        for(int i = 0; i < runs.size(); i += this.numBuffers - 1) {
+            List<Run> batch = runs.subList(i, Math.min(i + this.numBuffers - 1, runs.size()));
+            Run mergedRun = mergeSortedRuns(batch);
+            result.add(mergedRun);
+        }
+        return result;
     }
 
     /**
@@ -145,11 +189,23 @@ public class SortOperator extends QueryOperator {
      * sorted order.
      */
     public Run sort() {
-        // Iterator over the records of the relation we want to sort
         Iterator<Record> sourceIterator = getSource().iterator();
 
-        // TODO(proj3_part1): implement
-        return makeRun(); // TODO(proj3_part1): replace this!
+        //PASS 0
+        List<Run> runs = new ArrayList<>();
+        while(sourceIterator.hasNext()){
+            BacktrackingIterator<Record> blockIterator =
+                    getBlockIterator(sourceIterator, getSchema(), this.numBuffers);
+            Run sortedRun = sortRun(blockIterator);
+            runs.add(sortedRun);
+        }
+
+        // PASS 1
+        while(runs.size() > 1){
+            runs = mergePass(runs);  // 更新排序过后的自己, 没轮减少 1/ (B - 1)
+        }
+
+        return runs.get(0);
     }
 
     /**
