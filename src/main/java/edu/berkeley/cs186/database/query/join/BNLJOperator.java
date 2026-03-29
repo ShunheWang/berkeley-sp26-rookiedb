@@ -183,6 +183,7 @@ public class BNLJOperator extends JoinOperator {
                         }
                         // 这时候需要重置的是 rightSourceIterator 会到1, 而不是rightPageIterator
                         this.rightSourceIterator.reset();
+                        // 再进行fetch那么就是右表的第一页数据
                         this.fetchNextRightPage();
                     }
                 }
