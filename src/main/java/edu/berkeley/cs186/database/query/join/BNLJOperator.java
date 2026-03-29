@@ -87,7 +87,23 @@ public class BNLJOperator extends JoinOperator {
          * Make sure you pass in the correct schema to this method.
          */
         private void fetchNextLeftBlock() {
-            // TODO(proj3_part1): implement
+            // 1. 如果left表无任何数据, 说明扫描完毕
+            if(!this.leftSourceIterator.hasNext()){
+                this.leftBlockIterator = null;
+                this.leftRecord = null;
+                return;
+            }
+            // 当前leftSourceIterator继续往后面读 b-2个页数据
+            this.leftBlockIterator = QueryOperator.getBlockIterator(
+                    this.leftSourceIterator, getLeftSource().getSchema(), numBuffers - 2
+            );
+
+            if(this.leftBlockIterator.hasNext()){
+                this.leftBlockIterator.markNext();
+                this.leftRecord = this.leftBlockIterator.next();
+            } else {
+                this.leftRecord = null;
+            }
         }
 
         /**
@@ -102,7 +118,15 @@ public class BNLJOperator extends JoinOperator {
          * Make sure you pass in the correct schema to this method.
          */
         private void fetchNextRightPage() {
-            // TODO(proj3_part1): implement
+            if(!this.rightSourceIterator.hasNext()) return;
+
+            this.rightPageIterator = QueryOperator.getBlockIterator(
+                    this.rightSourceIterator, getRightSource().getSchema(), 1
+            );
+
+            if(this.rightPageIterator != null) {
+                this.rightPageIterator.markNext();
+            }
         }
 
         /**
@@ -114,8 +138,55 @@ public class BNLJOperator extends JoinOperator {
          * of JoinOperator).
          */
         private Record fetchNextRecord() {
-            // TODO(proj3_part1): implement
-            return null;
+            while (true) {
+                // CASE 1: 当前右页还有数据, 直接匹配
+                if(this.rightPageIterator != null && this.rightPageIterator.hasNext()){
+                    Record rightRecord = this.rightPageIterator.next();
+                    if(this.leftRecord != null && compare(this.leftRecord, rightRecord) == 0){
+                        return this.leftRecord.concat(rightRecord);
+                    }
+                // CASE 2: 右页读完了, 但左块还有数据, 针对的其实是左块中的每一条数据
+                } else if(this.leftBlockIterator != null && this.leftBlockIterator.hasNext()){
+                    this.leftRecord = this.leftBlockIterator.next();
+                    // 因为左块迭代器做了移动，每一个迭代器的行为应该是匹配右侧每一个值，所以这里要重置右迭代器
+                    // 假设左块: [1..100], 右页: [A..Z]
+                    // 进来CASE 2的条件为: 对于1来说, 已经把A..Z都匹配过了, 如果有匹配中的, CASE 1 已经输出过了,
+                    // 现在要把1 推到下一条数据, 也就是2, 此时rightPageIterator 现在是Z
+                    // 所以需要reset 重置到A
+                    if(this.rightPageIterator != null) {
+                        this.rightPageIterator.reset();
+                    }
+                } else {
+                    // CASE 3: 左块与右页数据都读完, 针对的是右页
+                    // [A..Z] 读完, 获取下一个右页数据[AA..ZZ]
+                    this.fetchNextRightPage();
+                    // 如果有[AA..ZZ], 那么对于左块来说要重置回到1, 因为CASE 1和2, 已经把[1..50] 与[A..Z] 匹配完毕,
+                    // 如果存在[AA..ZZ] 那么将要匹配的是[1..50] 与[AA..ZZ]
+                    if(this.rightPageIterator != null && this.rightPageIterator.hasNext()){
+                        // 重置左块到开始位置，重新扫描左块
+                        if(this.leftBlockIterator != null) {
+                            this.leftBlockIterator.reset();
+                            if(this.leftBlockIterator.hasNext()) {
+                                this.leftRecord = this.leftBlockIterator.next();
+                                // 这里不能 markNext, 也不需要 markNext
+                            } else {
+                                this.leftRecord = null;
+                            }
+                        }
+                    }
+                    // CASE 4: 对应左块 [1..50] 已经把对应的右页[A..Z], [AA..ZZ], [AAA..ZZZ]... 全部匹配过
+                    // 那么将左块推到下一个左块数据去[51..100]
+                    else {
+                        this.fetchNextLeftBlock();
+                        if(this.leftBlockIterator == null || !this.leftBlockIterator.hasNext()){
+                            return null;
+                        }
+                        // 这时候需要重置的是 rightSourceIterator 会到1, 而不是rightPageIterator
+                        this.rightSourceIterator.reset();
+                        this.fetchNextRightPage();
+                    }
+                }
+            }
         }
 
         /**

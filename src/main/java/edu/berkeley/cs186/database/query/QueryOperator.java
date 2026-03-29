@@ -15,9 +15,9 @@ import java.util.Iterator;
 import java.util.List;
 
 public abstract class QueryOperator implements Iterable<Record> {
-    protected QueryOperator source;
-    protected Schema outputSchema;
-    protected TableStats stats;
+    protected QueryOperator source; // 数据源：上一个算子
+    protected Schema outputSchema;  // 输出表结构（列名+类型）
+    protected TableStats stats; // 统计信息（优化器用）
 
     public enum OperatorType {
         PROJECT,
@@ -31,7 +31,7 @@ public abstract class QueryOperator implements Iterable<Record> {
         MATERIALIZE
     }
 
-    private OperatorType type;
+    private OperatorType type;  // 算子类型
 
     /**
      * Creates a QueryOperator without a set source, destination, or schema.
