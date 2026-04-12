@@ -139,8 +139,64 @@ public class SortMergeOperator extends JoinOperator {
          * or null if there are no more records to join.
          */
         private Record fetchNextRecord() {
-            // TODO(proj3_part1): implement
-            return null;
+            if (leftRecord == null || rightRecord == null) {
+                return null;
+            }
+
+            while (true) {
+                int cmp = compare(leftRecord, rightRecord);
+
+                // Case 1: leftRecord == rightRecord (键值匹配)
+                if (cmp == 0) {
+                    // 键值匹配：生成连接结果
+                    if (!marked) {
+                        // 首次匹配时标记右表位置, 后续回溯
+                        rightIterator.markPrev();
+                        marked = true;
+                    }
+
+                    Record result = leftRecord.concat(rightRecord);
+
+                    // 右指针探测下一个
+                    if (rightIterator.hasNext()) {
+                        rightRecord = rightIterator.next();
+                    } else {
+                        // 提前处理
+                        if (leftIterator.hasNext()) {
+                            leftRecord = leftIterator.next();
+                            rightIterator.reset();
+                            rightRecord = rightIterator.hasNext() ? rightIterator.next() : null;
+                        } else {
+                            leftRecord = null;
+                        }
+                    }
+
+                    return result;
+
+                } else if (cmp < 0) {
+                    // Case 2: leftRecord < rightRecord (左指针落后)
+                    if (leftIterator.hasNext()) {
+                        leftRecord = leftIterator.next();
+                        if (marked) {
+
+                            rightIterator.reset();
+                            rightRecord = rightIterator.hasNext() ? rightIterator.next() : null;
+                            marked = false;
+                        }
+                    } else {
+                        return null;
+                    }
+
+                } else {
+                    // Case 3: leftRecord > rightRecord (右指针落后)
+                    if (rightIterator.hasNext()) {
+                        rightRecord = rightIterator.next();
+                    } else {
+                        return null;
+                    }
+                    marked = false;
+                }
+            }
         }
 
         @Override
