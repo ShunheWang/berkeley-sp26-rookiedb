@@ -21,7 +21,12 @@ public enum LockType {
         if (a == null || b == null) {
             throw new NullPointerException("null lock type");
         }
-        // TODO(proj4_part1): implement
+        if (b == S) return a == S || a == IS || a == NL;
+        if (b == X) return a == NL;
+        if (b == IS) return a == S || a == IS || a == IX || a == SIX || a == NL;
+        if (b == IX) return a == IS || a == IX || a == NL;
+        if (b == SIX) return a == IS || a == NL;
+        if (b == NL) return true;
 
         return false;
     }
@@ -53,8 +58,11 @@ public enum LockType {
         if (parentLockType == null || childLockType == null) {
             throw new NullPointerException("null lock type");
         }
-        // TODO(proj4_part1): implement
 
+        // 父锁必须满足意向权限 >= 子锁需要的意向锁
+        if (parentLockType == NL || parentLockType == S) return childLockType == NL;
+        if (parentLockType == IS) return childLockType == IS || childLockType == S || childLockType == NL;
+        if (parentLockType == IX || parentLockType == SIX || parentLockType == X) return true;
         return false;
     }
 
@@ -68,7 +76,13 @@ public enum LockType {
         if (required == null || substitute == null) {
             throw new NullPointerException("null lock type");
         }
-        // TODO(proj4_part1): implement
+        // 替代规则：权限 >= 需要的权限
+        if (substitute == NL) return required == NL;
+        if (substitute == IS) return required == IS || required == NL;
+        if (substitute == IX) return required == IX || required == IS || required == NL;
+        if (substitute == S) return required != X && required != IX && required != SIX && required != IS;
+        if (substitute == SIX) return required == NL || required == IS || required == IX || required == S || required == SIX;
+        if (substitute == X) return true;
 
         return false;
     }
