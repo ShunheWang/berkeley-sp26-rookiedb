@@ -4,8 +4,11 @@ package edu.berkeley.cs186.database.concurrency;
  * Represents a lock held by a transaction on a resource.
  */
 public class Lock {
+    // 锁对应的资源
     public ResourceName name;
+    // 锁类型
     public LockType lockType;
+    // 事物id
     public Long transactionNum;
 
     public Lock(ResourceName name, LockType lockType, long transactionNum) {

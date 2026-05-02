@@ -33,19 +33,24 @@ import java.util.*;
 public class LockManager {
     // transactionLocks is a mapping from transaction number to a list of lock
     // objects held by that transaction.
+    // 存储所有<事物id,list(事物里所有锁)>
     private Map<Long, List<Lock>> transactionLocks = new HashMap<>();
 
     // resourceEntries is a mapping from resource names to a ResourceEntry
     // object, which contains a list of Locks on the object, as well as a
     // queue for requests on that resource.
+    // 存储所有<资源名称, 对应资源>
     private Map<ResourceName, ResourceEntry> resourceEntries = new HashMap<>();
 
     // A ResourceEntry contains the list of locks on a resource, as well as
     // the queue for requests for locks on the resource.
     private class ResourceEntry {
         // List of currently granted locks on the resource.
+        // 每个资源中授权的锁
         List<Lock> locks = new ArrayList<>();
         // Queue for yet-to-be-satisfied lock requests on this resource.
+        // 存储每个资源等待锁对应的请求参与排队,
+        // LockRequest 实际上存的是 事物 + 锁 + releasedLocks 特殊性: 处理的是当事物加上锁时, 需要释放的冗余锁
         Deque<LockRequest> waitingQueue = new ArrayDeque<>();
 
         // Below are a list of helper methods we suggest you implement.
