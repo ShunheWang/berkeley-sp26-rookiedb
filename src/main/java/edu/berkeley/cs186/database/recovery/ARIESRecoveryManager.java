@@ -297,12 +297,35 @@ public class ARIESRecoveryManager implements RecoveryManager {
      * @return LSN of last record written to log
      */
     @Override
-    public long logPageWrite(long transNum, long pageNum, short pageOffset, byte[] before,
-                             byte[] after) {
+    public long logPageWrite(long transNum, long pageNum, short pageOffset, byte[] before, byte[] after) {
         assert (before.length == after.length);
         assert (before.length <= BufferManager.EFFECTIVE_PAGE_SIZE / 2);
-        // TODO(proj5): implement
-        return -1L;
+
+        // 获取事务
+        TransactionTableEntry txEntry = transactionTable.get(transNum);
+        if (txEntry == null) throw new IllegalArgumentException("Transaction " + transNum + " not found.");
+
+        // 创建页面更新日志记录
+        long prevLSN = txEntry.lastLSN;
+        UpdatePageLogRecord logRecord = new UpdatePageLogRecord(
+                transNum,
+                pageNum,
+                prevLSN,
+                pageOffset,
+                before,
+                after
+        );
+
+        // 写入日志并获取新的 LSN
+        long newLSN = logManager.appendToLog(logRecord);
+
+        // 更新事务的最后一条日志 LSN
+        txEntry.lastLSN = newLSN;
+
+        // 标记页面为脏页（记录到脏页表）
+        dirtyPage(pageNum, newLSN);
+
+        return newLSN;
     }
 
     /**
