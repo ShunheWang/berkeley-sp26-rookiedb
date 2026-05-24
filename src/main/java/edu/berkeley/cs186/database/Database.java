@@ -934,17 +934,25 @@ public class Database implements AutoCloseable {
         @Override
         public void close() {
             try {
-                // TODO(proj4_part2)
-                return;
+                List<Lock> allLocks = Database.this.lockManager.getLocks(this);
+
+                // 1. 按路径深度降序排序：子节点优先释放
+                allLocks.sort(Comparator.comparingInt((Lock lock) ->
+                        (int) lock.name.toString().chars().filter(c -> c == '/').count()
+                ).reversed());
+
+                // 2. 从子节点向父节点依次释放锁
+                for (Lock lock : allLocks) {
+                    LockContext context = LockContext.fromResourceName(Database.this.lockManager, lock.name);
+                    context.release(this);
+                }
             } catch (Exception e) {
-                // There's a chance an error message from your release phase
-                // logic can get suppressed. This guarantees that the stack
-                // trace at least shows up somewhere before suppression.
-                // https://stackoverflow.com/questions/7849416/what-is-a-suppressed-exception
                 e.printStackTrace();
                 throw e;
             } finally {
-                if (!this.recoveryTransaction) TransactionContext.unsetTransaction();
+                if (!this.recoveryTransaction) {
+                    TransactionContext.unsetTransaction();
+                }
             }
         }
 

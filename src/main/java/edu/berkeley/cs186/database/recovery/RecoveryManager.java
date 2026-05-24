@@ -14,10 +14,16 @@ public interface RecoveryManager extends AutoCloseable {
     void initialize();
 
     /**
-     * Sets the buffer/disk managers. This is not part of the constructor because of the cyclic dependency
-     * between the buffer manager and recovery manager (the buffer manager must interface with the
+     * Sets the buffer/disk managers.
+     * 赋值缓冲管理器磁盘管理器
+     * This is not part of the constructor because of the cyclic dependency
+     * between the buffer manager and recovery manager
+     * 这不能组成构造器的一部分，因为bm和rm相互依赖
+     * (the buffer manager must interface with the
      * recovery manager to block page evictions until the log has been flushed, but the recovery
      * manager needs to interface with the buffer manager to write the log and redo changes).
+     * 缓存管理器需要对接恢复管理器，在日志完成刷盘前阻止页面淘汰；
+     * 而恢复管理器又需要对接缓存管理器，完成日志写入与数据重做操作。
      * @param diskSpaceManager disk space manager
      * @param bufferManager buffer manager
      */

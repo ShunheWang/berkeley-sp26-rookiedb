@@ -92,8 +92,26 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long commit(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        // 1. 从事务表获取事务条目
+        TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+        // 2. 事务不存在 & 事务对象不能为空
+        if (transactionEntry == null) throw new IllegalArgumentException("Transaction " + transNum + " not found.");
+        Transaction transaction = transactionEntry.transaction;
+        if (transaction == null) throw new IllegalStateException("Transaction " + transNum + " has a null transaction instance.");
+
+        // 3. 构建提交日志记录
+        long prevLSN = transactionEntry.lastLSN;
+        LogRecord commitRecord = new CommitTransactionLogRecord(transNum, prevLSN);
+
+        // 4. 追加日志并刷盘
+        long commitLSN = logManager.appendToLog(commitRecord);
+        flushToLSN(commitLSN);
+
+        // 5. 更新事务元数据 + 状态
+        transactionEntry.lastLSN = commitLSN;
+        transaction.setStatus(Transaction.Status.COMMITTING);
+
+        return commitLSN;
     }
 
     /**
@@ -108,8 +126,25 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long abort(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        // 1. 从事务表获取事务条目
+        TransactionTableEntry transactionEntry = transactionTable.get(transNum);
+        // 2. 事务不存在 & 事务对象不能为空
+        if (transactionEntry == null) throw new IllegalArgumentException("Transaction " + transNum + " not found.");
+        Transaction transaction = transactionEntry.transaction;
+        if (transaction == null) throw new IllegalStateException("Transaction " + transNum + " instance is null.");
+
+        // 3. 构建提交日志记录
+        long prevLSN = transactionEntry.lastLSN;
+        LogRecord abortRecord = new AbortTransactionLogRecord(transNum, prevLSN);
+
+        // 4. 写入日志
+        long abortLSN = logManager.appendToLog(abortRecord);
+
+        // 5. 更新事务表的 lastLSN + status
+        transactionEntry.lastLSN = abortLSN;
+        transaction.setStatus(Transaction.Status.ABORTING);
+
+        return abortLSN;
     }
 
     /**
@@ -126,8 +161,41 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public long end(long transNum) {
-        // TODO(proj5): implement
-        return -1L;
+        // 1. 事务合法性校验 & 对象合法性教研
+        TransactionTableEntry entry = transactionTable.get(transNum);
+        if (entry == null) throw new IllegalArgumentException("Transaction " + transNum + " not found.");
+
+        Transaction transaction = entry.transaction;
+        if (transaction == null) {
+            throw new IllegalStateException("Transaction " + transNum + " instance is null.");
+        }
+
+        // 2. 如果事务正在中止，完整回滚
+        if (transaction.getStatus() == Transaction.Status.ABORTING) {
+            // 注意: 从最后一条日志向前遍历，找到当前事物的 fistLSN
+            // 避免直接辅助为: 0，性能太差因为每次都要从下遍历到日志的头，也就是第一条日志
+            LogRecord current = logManager.fetchLogRecord(entry.lastLSN);
+            while (current != null && current.getPrevLSN().isPresent()) {
+                current = logManager.fetchLogRecord(current.getPrevLSN().get());
+            }
+            // 回滚到事务的第一条日志
+            long firstLSN = current.getLSN();
+            rollbackToLSN(transNum, firstLSN);
+        }
+
+        // 3. 写入事务结束日志
+        EndTransactionLogRecord endRecord = new EndTransactionLogRecord(transNum, entry.lastLSN);
+        long endLSN = logManager.appendToLog(endRecord);
+
+        // 4. 更新事务状态
+        entry.lastLSN = endLSN;
+        transaction.cleanup();
+        transaction.setStatus(Transaction.Status.COMPLETE);
+
+        // 5. 从事务表移除
+        transactionTable.remove(transNum);
+
+        return endLSN;
     }
 
     /**
@@ -146,15 +214,44 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *
      * @param transNum transaction to perform a rollback for
      * @param LSN LSN to which we should rollback
+     *
+     * 说明：
+     * 回滚事务到指定的LSN（ARIES undo逻辑）
+     * 从当前最后一条日志开始，反向undo直到目标LSN
      */
     private void rollbackToLSN(long transNum, long LSN) {
+        // 1. 校验事务是否存在
         TransactionTableEntry transactionEntry = transactionTable.get(transNum);
-        LogRecord lastRecord = logManager.fetchLogRecord(transactionEntry.lastLSN);
+        if (transactionEntry == null) throw new IllegalArgumentException("Transaction " + transNum + " not found");
+
+        // 2. 获取当前最后一条日志
+        long lastLSN = transactionEntry.lastLSN;
+        LogRecord lastRecord = logManager.fetchLogRecord(lastLSN);
         long lastRecordLSN = lastRecord.getLSN();
-        // Small optimization: if the last record is a CLR we can start rolling
-        // back from the next record that hasn't yet been undone.
+
+        // 3. 初始化 undo 指针，存在用一开始就是 CLR，因此从 undoNextLSN 开始
         long currentLSN = lastRecord.getUndoNextLSN().orElse(lastRecordLSN);
-        // TODO(proj5) implement the rollback logic described above
+
+        // 4. 反向遍历日志，执行undo直到达到目标LSN
+        while (currentLSN > LSN && currentLSN != 0) {
+            LogRecord logRecord = logManager.fetchLogRecord(currentLSN);
+
+            // 只处理可undo的日志
+            if (logRecord.isUndoable()) {
+                // 生成 CLR
+                LogRecord clr = logRecord.undo(transactionEntry.lastLSN);
+                long clrLSN = logManager.appendToLog(clr);
+
+                // 执行CLR的redo（即buffer层的数据回滚并标记为脏页）
+                clr.redo(this, diskSpaceManager, bufferManager);
+
+                // 更新事务最后LSN
+                transactionEntry.lastLSN = clrLSN;
+            }
+
+            // 移动到前一条日志
+            currentLSN = logRecord.getPrevLSN().orElse(0L);
+        }
     }
 
     /**
