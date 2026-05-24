@@ -499,8 +499,8 @@ public class ARIESRecoveryManager implements RecoveryManager {
 
         // All of the transaction's changes strictly after the record at LSN should be undone.
         long savepointLSN = transactionEntry.getSavepoint(name);
+        rollbackToLSN(transNum, savepointLSN);
 
-        // TODO(proj5): implement
         return;
     }
 
