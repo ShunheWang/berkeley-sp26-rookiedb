@@ -520,22 +520,50 @@ public class ARIESRecoveryManager implements RecoveryManager {
      */
     @Override
     public synchronized void checkpoint() {
-        // Create begin checkpoint log record and write to log
+        // 1. 写入 checkpoint 开始日志
         LogRecord beginRecord = new BeginCheckpointLogRecord();
         long beginLSN = logManager.appendToLog(beginRecord);
 
         Map<Long, Long> chkptDPT = new HashMap<>();
         Map<Long, Pair<Transaction.Status, Long>> chkptTxnTable = new HashMap<>();
 
-        // TODO(proj5): generate end checkpoint record(s) for DPT and transaction table
+        // 2. 遍历脏页表，分批写入 EndCheckpoint 日志
+        for (Map.Entry<Long, Long> entry : dirtyPageTable.entrySet()) {
+            // 检查是否会超出单条日志容量，超出则先写入一条
+            if (!EndCheckpointLogRecord.fitsInOneRecord(chkptDPT.size() + 1, chkptTxnTable.size())) {
+                LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(endRecord);
+                chkptDPT.clear();
+            }
+            chkptDPT.put(entry.getKey(), entry.getValue());
+        }
 
-        // Last end checkpoint record
+        // 3. 遍历事务表，记录事务状态 + lastLSN
+        for (Map.Entry<Long, TransactionTableEntry> entry : transactionTable.entrySet()) {
+            long transNum = entry.getKey();
+            TransactionTableEntry txEntry = entry.getValue();
+            Transaction.Status status = txEntry.transaction.getStatus();
+            long lastLSN = txEntry.lastLSN;
+
+            // 检查容量，超出则刷一条日志
+            if (!EndCheckpointLogRecord.fitsInOneRecord(chkptDPT.size(), chkptTxnTable.size() + 1)) {
+                LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
+                logManager.appendToLog(endRecord);
+                chkptDPT.clear();
+                chkptTxnTable.clear();
+            }
+
+            chkptTxnTable.put(transNum, new Pair<>(status, lastLSN));
+        }
+
+        // 4. 把最后剩余的部分写入最终 EndCheckpoint
         LogRecord endRecord = new EndCheckpointLogRecord(chkptDPT, chkptTxnTable);
         logManager.appendToLog(endRecord);
-        // Ensure checkpoint is fully flushed before updating the master record
+
+        // 5. 刷盘确保持久化
         flushToLSN(endRecord.getLSN());
 
-        // Update master record
+        // 6. 更新主记录（master record）
         MasterLogRecord masterRecord = new MasterLogRecord(beginLSN);
         logManager.rewriteMasterRecord(masterRecord);
     }
