@@ -658,17 +658,172 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *  - if RECOVERY_ABORTING: no action needed
      */
     void restartAnalysis() {
-        // Read master record
+        // 1. 获取 master record (固定位置 LSN = 0L)
         LogRecord record = logManager.fetchLogRecord(0L);
-        // Type checking
+        // 2. 声明类型检查
         assert (record != null && record.getType() == LogType.MASTER);
-        MasterLogRecord masterRecord = (MasterLogRecord) record;
-        // Get start checkpoint LSN
+        MasterLogRecord masterRecord = (MasterLogRecord) record; // 强转普通日志为主记录
+        // 3. 获取最近一次的 start checkpoint lsn
         long LSN = masterRecord.lastCheckpointLSN;
-        // Set of transactions that have completed
+        // 4. 存放获取带有end log日志的事物
         Set<Long> endedTransactions = new HashSet<>();
-        // TODO(proj5): implement
+        // 5. 获取start checkpoint lsn位置的日志迭代器
+        Iterator<LogRecord> logIterator = logManager.scanFrom(LSN);
+
+        // 6. 遍历从start checkpoint lsn位置向下读取日志数据
+        while (logIterator.hasNext()) {
+            LogRecord logRecord = logIterator.next();
+            // 1. 处理事务操作日志：更新事务 lastLSN，不存在则创建
+            Optional<Long> optTransNum = logRecord.getTransNum();
+            if (optTransNum.isPresent()) {
+                long transNum = optTransNum.get();
+
+                // 事务不存在则新建并启动
+                if (!transactionTable.containsKey(transNum)) {
+                    Transaction tx = newTransaction.apply(transNum);
+                    startTransaction(tx);
+                }
+
+                // 更新该事务的最后一条日志 LSN
+                TransactionTableEntry txEntry = transactionTable.get(transNum);
+                txEntry.lastLSN = logRecord.getLSN();
+            }
+
+            // 2. 处理页面操作日志：更新脏页表
+            Optional<Long> optPageNum = logRecord.getPageNum();
+            if (optPageNum.isPresent()) {
+                long pageNum = optPageNum.get();
+                LogType type = logRecord.getType();
+
+                switch (type) {
+                    case UPDATE_PAGE:
+                    case UNDO_UPDATE_PAGE: // 内存页面变脏，加入脏页表
+                        dirtyPage(pageNum, logRecord.getLSN());
+                        break;
+                    case FREE_PAGE:
+                    case UNDO_ALLOC_PAGE: // 已刷盘，从脏页表移除
+                        dirtyPageTable.remove(pageNum);
+                        break;
+                    // ALLOC_PAGE / UNDO_FREE_PAGE 不做处理
+                    default:
+                        break;
+                }
+            }
+
+            // 3. 处理事务状态变更日志 (COMMIT / ABORT / END)
+            LogType type = logRecord.getType();
+
+            if (type == LogType.COMMIT_TRANSACTION || type == LogType.ABORT_TRANSACTION || type == LogType.END_TRANSACTION) {
+                // 读取关联事务编号
+                long transNum = logRecord.getTransNum().get();
+                TransactionTableEntry txEntry = transactionTable.get(transNum);
+
+                switch (type) {
+                    case COMMIT_TRANSACTION: // 标记事务进入提交阶段
+                        txEntry.transaction.setStatus(Transaction.Status.COMMITTING);
+                        break;
+                    case ABORT_TRANSACTION: // 标记事务恢复中止状态
+                        txEntry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                        break;
+                    case END_TRANSACTION:   // 事务收尾清理，注销活跃事务记录
+                        txEntry.transaction.cleanup();
+                        txEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+                        endedTransactions.add(transNum);    // 加入到 endedTransactions
+                        transactionTable.remove(transNum);  // 移除事物表
+                        break;
+                }
+            }
+
+            // 4. 处理 END_CHECKPOINT 日志：合并检查点的脏页表和事务表快照
+            else if (type == LogType.END_CHECKPOINT) {
+                // 强转至 end checkpoint log rec
+                EndCheckpointLogRecord cpRecord = (EndCheckpointLogRecord) logRecord;
+
+                // 合并脏页表：检查点的 recLSN 更权威直接覆盖
+                for (Map.Entry<Long, Long> entry : cpRecord.getDirtyPageTable().entrySet()) {
+                    dirtyPageTable.put(entry.getKey(), entry.getValue());
+                }
+
+                // 合并事务表
+                for (Map.Entry<Long, Pair<Transaction.Status, Long>> entry : cpRecord.getTransactionTable().entrySet()) {
+                    long transNum = entry.getKey();
+                    Transaction.Status cpStatus = entry.getValue().getFirst();
+                    long cpLastLSN = entry.getValue().getSecond();
+
+                    // 跳过已结束的事务
+                    if (endedTransactions.contains(transNum)) continue;
+
+                    // 事务不存在则创建
+                    if (!transactionTable.containsKey(transNum)) {
+                        Transaction tx = newTransaction.apply(transNum);
+                        startTransaction(tx);
+                    }
+
+                    TransactionTableEntry txEntry = transactionTable.get(transNum);
+
+                    // 更新 lastLSN，使用较大值，如果小说明是旧数据，不做更新
+                    if (cpLastLSN > txEntry.lastLSN) txEntry.lastLSN = cpLastLSN;
+
+                    // 状态只能向前推进，不能回退
+                    if (isValidStateTransition(txEntry.transaction.getStatus(), cpStatus)) {
+                        if (cpStatus == Transaction.Status.ABORTING) {
+                            txEntry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+                        } else {
+                            txEntry.transaction.setStatus(cpStatus);
+                        }
+                    }
+                }
+            }
+
+        }
+
+        // 5. 扫描结束后，处理事务表中剩余的未完成事务
+        Iterator<Map.Entry<Long, TransactionTableEntry>> iterator = transactionTable.entrySet().iterator();
+        while (iterator.hasNext()) {
+            Map.Entry<Long, TransactionTableEntry> entry = iterator.next();
+            long transNum = entry.getKey();
+            TransactionTableEntry tableEntry = entry.getValue();
+            Transaction.Status status = tableEntry.transaction.getStatus();
+
+            if (status == Transaction.Status.COMMITTING) {
+                // 已发出提交日志但未写END日志，完成收尾
+                tableEntry.transaction.cleanup();
+                tableEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+
+                // 写入END事务日志，标记事务彻底完成
+                logManager.appendToLog(new EndTransactionLogRecord(transNum, tableEntry.lastLSN));
+                iterator.remove();
+            }
+            else if (status == Transaction.Status.RUNNING) {
+                // 崩溃时仍在运行，标记为需要恢复回滚
+                tableEntry.transaction.setStatus(Transaction.Status.RECOVERY_ABORTING);
+
+                // 写入ABORT日志，更新事务最后LSN
+                long abortLSN = logManager.appendToLog(new AbortTransactionLogRecord(transNum, tableEntry.lastLSN));
+                tableEntry.lastLSN = abortLSN;
+            }
+            // RECOVERY_ABORTING 状态：保留，等待 Undo 阶段处理
+        }
+
         return;
+    }
+
+    /**
+     * ARIES 事务状态推进规则：仅允许合法的状态转移，禁止状态回退
+     */
+    private boolean isValidStateTransition(Transaction.Status current, Transaction.Status next) {
+        if (current == next) {
+            return false;
+        }
+
+        switch (current) {
+            case RUNNING: return next == Transaction.Status.COMMITTING || next == Transaction.Status.ABORTING;
+            case COMMITTING:
+            case ABORTING:
+            case RECOVERY_ABORTING: return next == Transaction.Status.COMPLETE;
+            case COMPLETE: return false;
+            default: return false;
+        }
     }
 
     /**
