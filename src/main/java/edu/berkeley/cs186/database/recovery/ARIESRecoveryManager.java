@@ -839,8 +839,50 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *   the pageLSN is checked, and the record is redone if needed.
      */
     void restartRedo() {
-        // TODO(proj5): implement
-        return;
+        // 1. 无脏页，无需重做
+        if (dirtyPageTable.isEmpty()) return;
+
+        // 2. Redo 起点: 脏页表中最小的 recLSN
+        long startLSN = Collections.min(dirtyPageTable.values());
+        Iterator<LogRecord> logIterator = logManager.scanFrom(startLSN);
+
+        // 3. 遍历
+        while (logIterator.hasNext()) {
+            LogRecord record = logIterator.next();
+
+            // 只处理可重做的日志
+            if (!record.isRedoable()) continue;
+
+            LogType type = record.getType();
+            // 4. 空间管理操作，直接重做（无需判断脏页 & PageLSN）
+            if (type == LogType.ALLOC_PART || type == LogType.FREE_PART
+                    || type == LogType.UNDO_ALLOC_PART || type == LogType.UNDO_FREE_PART
+                    || type == LogType.ALLOC_PAGE || type == LogType.UNDO_FREE_PAGE) {
+                record.redo(this, diskSpaceManager, bufferManager);
+            }
+            // 5. 页面数据操作，需要判断脏页 + LSN 后再重做
+            else if (type == LogType.UPDATE_PAGE || type == LogType.UNDO_UPDATE_PAGE
+                    || type == LogType.UNDO_ALLOC_PAGE || type == LogType.FREE_PAGE) {
+                // 5.1. 必须有页号 + 页在脏页表中
+                if (!record.getPageNum().isPresent() || !dirtyPageTable.containsKey(record.getPageNum().get())) continue;
+
+                long pageNum = record.getPageNum().get();
+                long recLSN = dirtyPageTable.get(pageNum);
+
+                // 5.2. 只有日志 LSN >= 页面 recLSN 才需要重做
+                if (record.getLSN() < recLSN) continue;
+
+                // 5.3. 获取页面并判断 PageLSN，避免重复重做
+                Page page = bufferManager.fetchPage(new DummyLockContext(), pageNum);
+                try {
+                    if (page.getPageLSN() < record.getLSN()) {
+                        record.redo(this, diskSpaceManager, bufferManager);
+                    }
+                } finally {
+                    page.unpin();
+                }
+            }
+        }
     }
 
     /**
