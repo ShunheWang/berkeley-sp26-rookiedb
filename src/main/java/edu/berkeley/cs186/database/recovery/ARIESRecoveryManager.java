@@ -899,8 +899,71 @@ public class ARIESRecoveryManager implements RecoveryManager {
      *   and remove from transaction table.
      */
     void restartUndo() {
-        // TODO(proj5): implement
-        return;
+        // 1. 定义最大堆：按 LSN 降序排列，每次取出最大 LSN 进行回滚
+        PriorityQueue<Pair<Long, TransactionTableEntry>> undoQueue = new PriorityQueue<>(
+                Comparator.comparing(Pair::getFirst, Comparator.reverseOrder()));
+
+        // 2. 初始化队列：将所有需要回滚的事务（RECOVERY_ABORTING）加入队列
+        for (TransactionTableEntry entry : transactionTable.values()) {
+            if (entry.transaction.getStatus() == Transaction.Status.RECOVERY_ABORTING) {
+                undoQueue.add(new Pair<>(entry.lastLSN, entry));
+            }
+        }
+
+        // 3. 每次取出 LSN 最大的日志记录进行 undo
+        while (!undoQueue.isEmpty()) {
+            Pair<Long, TransactionTableEntry> currentPair = undoQueue.poll();
+            long currentLSN = currentPair.getFirst();
+            TransactionTableEntry txEntry = currentPair.getSecond();
+
+            // 读取当前 LSN 对应的日志
+            LogRecord record = logManager.fetchLogRecord(currentLSN);
+
+            // 如果当前日志可撤销，生成并执行 CLR（补偿日志）
+            if (record.isUndoable()) {
+                // 生成 CLR（仅构造日志，不执行回滚）
+                LogRecord clr = record.undo(txEntry.lastLSN);
+
+                // 将 CLR 写入日志文件
+                long clrLSN = logManager.appendToLog(clr);
+
+                // 更新事务的 lastLSN 为新生成的 CLR 的 LSN
+                txEntry.lastLSN = clrLSN;
+
+                // 执行 CLR.redo() 真正数据回滚
+                clr.redo(this, diskSpaceManager, bufferManager);
+
+                // 关于 clr.redo() 的顺序重要性以及它一定要放在最后：
+                // 1. 生成 CLR 并写入日志
+                // 2. 先更新事务 lastLSN
+                // 3. 最后执行 CLR.redo() 修改数据
+                // 若先执行 redo 物理修改、再更新 lastLSN，一旦崩溃会导致日志链断裂、事务状态与页面状态不一致，
+                // 违反 WAL 预写日志原则；只有先完成日志写入与 lastLSN 更新，再应用数据修改，
+                // 才能保证日志永远领先于数据，确保恢复过程中状态始终正确且可追溯
+            }
+
+            // 获取下一个需要回滚的 LSN：优先 undoNextLSN，否则 prevLSN
+            long nextLSN;
+            if (record.getUndoNextLSN().isPresent()) {
+                nextLSN = record.getUndoNextLSN().get();
+            } else {
+                nextLSN = record.getPrevLSN().orElse(0L);
+            }
+
+            // 4. 判断事务是否完成撤销
+            if (nextLSN == 0) {
+                // 事务已完全撤销，进行清理和状态更新
+                txEntry.transaction.cleanup();
+                txEntry.transaction.setStatus(Transaction.Status.COMPLETE);
+                // 写入 EndTransactionLogRecord
+                logManager.appendToLog(new EndTransactionLogRecord(txEntry.transaction.getTransNum(), txEntry.lastLSN));
+                // 从事务表中移除
+                transactionTable.remove(txEntry.transaction.getTransNum());
+            } else {
+                // 继续撤销该事务的更早记录
+                undoQueue.add(new Pair<>(nextLSN, txEntry));
+            }
+        }
     }
 
     /**

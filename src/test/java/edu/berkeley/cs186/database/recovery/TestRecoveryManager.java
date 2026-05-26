@@ -1206,11 +1206,6 @@ public class TestRecoveryManager {
         logManager.fetchLogRecord(LSNs.get(1)).redo(recoveryManager, dsm, bm);
         logManager.fetchLogRecord(LSNs.get(2)).redo(recoveryManager, dsm, bm);
 
-        // 2. Simulates a database shutdown
-        // flush everything - recovery tests should always start
-        // with a clean load from disk, and here we want everything sent to disk first.
-        // Note: this does not call RecoveryManager#close - it only closes the
-        // buffer manager and disk space manager.
         shutdownRecoveryManager(recoveryManager);
 
         // load from disk again
