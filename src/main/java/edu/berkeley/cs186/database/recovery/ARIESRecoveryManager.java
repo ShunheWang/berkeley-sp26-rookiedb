@@ -827,61 +827,183 @@ public class ARIESRecoveryManager implements RecoveryManager {
     }
 
     /**
-     * This method performs the redo pass of restart recovery.
+     * Set of log record types that are space management operations and should always be redoneduring recovery.
+     * These operations include partition/page allocation, freeing, and their undo operations.
+     */
+    private static final Set<LogType> SPACE_MANAGEMENT_TYPES = Set.of(
+            LogType.ALLOC_PART, LogType.FREE_PART,
+            LogType.UNDO_ALLOC_PART, LogType.UNDO_FREE_PART,
+            LogType.ALLOC_PAGE, LogType.UNDO_FREE_PAGE);
+
+    /**
+     * Set of log record types that are page data operations and should be conditionally redoed during recovery.
+     * These operations include page updates, undo updates, page freeing, and undo allocation operations.
+     * Each record type must be validated against the dirty page table and PageLSN before redoing.
+     */
+    private static final Set<LogType> PAGE_DATA_OPERATION_TYPES = Set.of(
+            LogType.UPDATE_PAGE, LogType.UNDO_UPDATE_PAGE,
+            LogType.UNDO_ALLOC_PAGE, LogType.FREE_PAGE);
+
+    /**
+     * Calculates the starting LSN for REDO pass from dirty page table.
+     * The start LSN is the minimum recLSN value from the dirty page table.
+     * If dirty page table is empty, returns -1 to indicate no REDO work needed.
      *
-     * First, determine the starting point for REDO from the dirty page table.
+     * @return minimum recLSN from dirty page table, or -1 if table is empty
+     */
+    private long calculateRedoStartLSN() {
+        return dirtyPageTable.isEmpty() ? -1 : Collections.min(dirtyPageTable.values());
+    }
+
+    /**
+     * Validates if a page data operation record should be redoed during recovery.
+     * A record should be redoed if:
+     * 1. The record has a page number (present in Optional)
+     * 2. The page is in the dirty page table
+     * 3. The record's LSN is >= the page's recLSN (ensures we only redo recent operations)
      *
-     * Then, scanning from the starting point, if the record is redoable and
-     * - partition-related (Alloc/Free/UndoAlloc/UndoFree..Part), always redo it
-     * - allocates a page (AllocPage/UndoFreePage), always redo it
-     * - modifies a page (Update/UndoUpdate/Free/UndoAlloc....Page) in
-     *   the dirty page table with LSN >= recLSN, the page is fetched from disk,
-     *   the pageLSN is checked, and the record is redone if needed.
+     * @param record the log record to validate
+     * @return true if the record should be redoed, false otherwise
+     */
+    private boolean shouldRedoPageDataOperation(LogRecord record) {
+        return record.getPageNum().isPresent()
+            && dirtyPageTable.containsKey(record.getPageNum().get())
+            && record.getLSN() >= dirtyPageTable.get(record.getPageNum().get());
+    }
+
+    /**
+     * Strategy interface for handling different types of log records during REDO.
+     * This pattern allows for clean separation of concerns and easy extension
+     * for new log record types.
+     */
+    private interface RedoRecordHandler {
+        /**
+         * Determines if this handler can process the given log record type.
+         *
+         * @param type the log record type to check
+         * @return true if this handler can process the record type
+         */
+        boolean canHandle(LogType type);
+
+        /**
+         * Handles the processing of a log record during REDO.
+         *
+         * @param record the log record to process
+         * @param manager the recovery manager instance
+         */
+        void handle(LogRecord record, ARIESRecoveryManager manager);
+    }
+
+    /**
+     * Handler for space management operations (always redo).
+     *
+     * Space management operations include partition/page allocation, freeing,
+     * and their undo operations. These operations should always be redone
+     * during recovery regardless of the dirty page table or PageLSN values.
+     */
+    private class SpaceManagementHandler implements RedoRecordHandler {
+        @Override
+        public boolean canHandle(LogType type) {
+            return SPACE_MANAGEMENT_TYPES.contains(type);
+        }
+
+        @Override
+        public void handle(LogRecord record, ARIESRecoveryManager manager) {
+            record.redo(manager, manager.diskSpaceManager, manager.bufferManager);
+        }
+    }
+
+    /**
+     * Handler for page data operations (conditional redo).
+     *
+     * Page data operations include updates, undo updates, page freeing,
+     * and undo allocation operations. These operations are conditionally
+     * redoed based on validation against the dirty page table and PageLSN.
+     * The validation should be performed before calling this handler.
+     */
+    private class PageDataOperationHandler implements RedoRecordHandler {
+        @Override
+        public boolean canHandle(LogType type) {
+            return PAGE_DATA_OPERATION_TYPES.contains(type);
+        }
+
+        @Override
+        public void handle(LogRecord record, ARIESRecoveryManager manager) {
+            // The record has already been validated by shouldRedoPageDataOperation
+            // before calling this handler. We just need to check PageLSN.
+            long pageNum = record.getPageNum().get();
+
+            Page page = manager.bufferManager.fetchPage(new DummyLockContext(), pageNum);
+            try {
+                if (page.getPageLSN() < record.getLSN()) {
+                    record.redo(manager, manager.diskSpaceManager, manager.bufferManager);
+                }
+            } finally {
+                page.unpin();
+            }
+        }
+    }
+
+    /**
+     * Dispatches a log record to the appropriate handler.
+     *
+     * Iterates through the list of handlers in order and delegates to the first
+     * handler that can process the record type. This assumes handlers are
+     * mutually exclusive in terms of the record types they handle.
+     *
+     * @param record the log record to dispatch
+     * @param handlers the list of available handlers
+     */
+    private void handleRecord(LogRecord record, List<RedoRecordHandler> handlers) {
+        for (RedoRecordHandler handler : handlers) {
+            if (handler.canHandle(record.getType())) {
+                handler.handle(record, this);
+                break;
+            }
+        }
+    }
+
+    /**
+     * Performs the redo pass of restart recovery using the ARIES algorithm.
+     *
+     * REDO Algorithm Overview:
+     * 1. If dirty page table is empty, return immediately (no work to do)
+     * 2. Calculate start LSN as the minimum recLSN from the dirty page table
+     * 3. Scan the log forward from the start LSN:
+     *    a. Skip non-redoable records (records where isRedoable() returns false)
+     *    b. For space management operations: always redo (ALLOC_PART, FREE_PART, etc.)
+     *    c. For page data operations: validate before redo using helper methods
+     *
+     * The REDO pass ensures that all necessary operations are reapplied to recover
+     * the database to a consistent state after a crash. It respects the PageLSN
+     * to avoid redundant redos and only redoes operations that weren't flushed to
+     * disk before the crash.
+     *
+     * @throws DatabaseException if there's an error during recovery operations
      */
     void restartRedo() {
-        // 1. 无脏页，无需重做
+        // 1. No dirty pages, nothing to redo
         if (dirtyPageTable.isEmpty()) return;
 
-        // 2. Redo 起点: 脏页表中最小的 recLSN
-        long startLSN = Collections.min(dirtyPageTable.values());
+        // 2. REDO start point: minimum recLSN from dirty page table
+        long startLSN = calculateRedoStartLSN();
         Iterator<LogRecord> logIterator = logManager.scanFrom(startLSN);
 
-        // 3. 遍历
+        // 3. Initialize record handlers
+        List<RedoRecordHandler> handlers = Arrays.asList(
+            new SpaceManagementHandler(),
+            new PageDataOperationHandler()
+        );
+
+        // 4. Iterate through log records
         while (logIterator.hasNext()) {
             LogRecord record = logIterator.next();
 
-            // 只处理可重做的日志
+            // Only process redoable records
             if (!record.isRedoable()) continue;
 
-            LogType type = record.getType();
-            // 4. 空间管理操作，直接重做（无需判断脏页 & PageLSN）
-            if (type == LogType.ALLOC_PART || type == LogType.FREE_PART
-                    || type == LogType.UNDO_ALLOC_PART || type == LogType.UNDO_FREE_PART
-                    || type == LogType.ALLOC_PAGE || type == LogType.UNDO_FREE_PAGE) {
-                record.redo(this, diskSpaceManager, bufferManager);
-            }
-            // 5. 页面数据操作，需要判断脏页 + LSN 后再重做
-            else if (type == LogType.UPDATE_PAGE || type == LogType.UNDO_UPDATE_PAGE
-                    || type == LogType.UNDO_ALLOC_PAGE || type == LogType.FREE_PAGE) {
-                // 5.1. 必须有页号 + 页在脏页表中
-                if (!record.getPageNum().isPresent() || !dirtyPageTable.containsKey(record.getPageNum().get())) continue;
-
-                long pageNum = record.getPageNum().get();
-                long recLSN = dirtyPageTable.get(pageNum);
-
-                // 5.2. 只有日志 LSN >= 页面 recLSN 才需要重做
-                if (record.getLSN() < recLSN) continue;
-
-                // 5.3. 获取页面并判断 PageLSN，避免重复重做
-                Page page = bufferManager.fetchPage(new DummyLockContext(), pageNum);
-                try {
-                    if (page.getPageLSN() < record.getLSN()) {
-                        record.redo(this, diskSpaceManager, bufferManager);
-                    }
-                } finally {
-                    page.unpin();
-                }
-            }
+            // Dispatch to appropriate handler
+            handleRecord(record, handlers);
         }
     }
 
