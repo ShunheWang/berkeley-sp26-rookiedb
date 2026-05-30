@@ -1,5 +1,9 @@
 package edu.berkeley.cs186.database.recovery;
 
+/**
+ * Enum representing different types of log records in the ARIES recovery protocol.
+ * Each log type serves a specific purpose in database recovery operations.
+ */
 public enum LogType {
     // master log record (stores current checkpoint)
     MASTER,
@@ -35,17 +39,33 @@ public enum LogType {
     // compensation log record for undoing a partition free
     UNDO_FREE_PART;
 
-    private static LogType[] values = LogType.values();
+    // Cache the values array to avoid repeated array creation
+    private static final LogType[] VALUES = LogType.values();
+    // Cache min and max values for boundary checks
+    private static final int MIN_VALUE = 1;
+    private static final int MAX_VALUE = VALUES.length;
 
+    /**
+     * Returns the integer value representing this log type.
+     * The value is ordinal + 1 to ensure a 1-based index.
+     *
+     * @return integer value of this log type
+     */
     public int getValue() {
         return ordinal() + 1;
     }
 
+    /**
+     * Converts an integer value back to the corresponding LogType enum.
+     *
+     * @param x the integer value to convert
+     * @return the corresponding LogType enum
+     * @throws IllegalArgumentException if the value is out of range
+     */
     public static LogType fromInt(int x) {
-        if (x < 1 || x > values.length) {
-            String err = String.format("Unknown TypeId ordinal %d.", x);
-            throw new IllegalArgumentException(err);
+        if (x < MIN_VALUE || x > MAX_VALUE) {
+            throw new IllegalArgumentException("Unknown TypeId ordinal: " + x);
         }
-        return values[x - 1];
+        return VALUES[x - 1];
     }
 }
