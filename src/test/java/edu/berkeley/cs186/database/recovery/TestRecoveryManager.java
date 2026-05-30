@@ -980,8 +980,8 @@ public class TestRecoveryManager {
         recoveryManager = loadRecoveryManager(testDir);
 
         // set up dirty page table - transaction table is empty (transaction ended)
-        dirtyPageTable.put(10000000002L, LSNs.get(2));
-        dirtyPageTable.put(10000000003L, LSNs.get(3));
+        recoveryManager.dirtyPageTable.put(10000000002L, LSNs.get(2));
+        recoveryManager.dirtyPageTable.put(10000000003L, LSNs.get(3));
 
         // 3. Run redo phase
         // set up checks for redo - these get called in sequence with each
