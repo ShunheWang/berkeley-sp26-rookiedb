@@ -453,4 +453,20 @@ public class LockManager {
     public synchronized LockContext databaseContext() {
         return context("database");
     }
+
+    /**
+     * Dump all lock information for debugging deadlock scenarios.
+     * Shows all transaction locks and resource entries.
+     */
+    public synchronized String getAllLockInfo() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("=== LockManager State ===\n");
+        sb.append("transactionLocks: ").append(transactionLocks).append("\n");
+        sb.append("resourceEntries:\n");
+        for (Map.Entry<ResourceName, ResourceEntry> entry : resourceEntries.entrySet()) {
+            sb.append("  ").append(entry.getKey()).append(" => ")
+              .append(entry.getValue().toString()).append("\n");
+        }
+        return sb.toString();
+    }
 }

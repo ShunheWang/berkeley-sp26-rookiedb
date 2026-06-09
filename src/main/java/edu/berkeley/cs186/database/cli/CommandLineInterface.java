@@ -195,6 +195,9 @@ public class CommandLineInterface {
             } else {
                 this.out.println(db.getLockManager().getLocks(tc));
             }
+        } else if (cmd.equals("alllocks")) {
+            // Show all locks across ALL transactions (for DDA debugging)
+            this.out.println(db.getLockManager().getAllLockInfo());
         } else {
             throw new IllegalArgumentException(String.format(
                 "`%s` is not a valid metacommand",
