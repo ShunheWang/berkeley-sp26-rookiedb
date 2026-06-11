@@ -61,11 +61,11 @@ class DummyTransaction extends Transaction {
 
     @Override
     public void cleanup() {
+        if (getStatus() == Status.COMPLETE) {
+            return;
+        }
         if (cleanedUp) {
             throw new RuntimeException("Transaction has already been cleaned up.");
-        }
-        if (getStatus() == Status.COMPLETE) {
-            throw new RuntimeException("Transaction cannot be cleaned up -- already complete.");
         }
         cleanedUp = true;
     }

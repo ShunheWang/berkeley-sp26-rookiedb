@@ -189,8 +189,8 @@ public class ARIESRecoveryManager implements RecoveryManager {
 
         // 4. 更新事务状态
         entry.lastLSN = endLSN;
-        transaction.cleanup();
         transaction.setStatus(Transaction.Status.COMPLETE);
+        transaction.cleanup();
 
         // 5. 从事务表移除
         transactionTable.remove(transNum);
