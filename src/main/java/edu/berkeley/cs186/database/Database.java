@@ -311,6 +311,36 @@ public class Database implements AutoCloseable {
         return lockManager;
     }
 
+    /**
+     * Returns start times for all active transactions.
+     * Used by DDA for Youngest First victim selection.
+     */
+    public Map<Long, Long> getTransactionTimes() {
+        Map<Long, Long> times = new HashMap<>();
+        for (Map.Entry<Long, TransactionImpl> e : transactionRegistry.entrySet()) {
+            times.put(e.getKey(), e.getValue().getStartTime());
+        }
+        return times;
+    }
+
+    /**
+     * Full lock info with transaction start times appended.
+     * Aggregates LockManager state + Transaction metadata.
+     * Used by \alllocks metacommand.
+     */
+    public String getAllLockInfo() {
+        StringBuilder sb = new StringBuilder(lockManager.getAllLockInfo());
+        sb.append("transactionTimes: {");
+        boolean first = true;
+        for (Map.Entry<Long, Long> e : getTransactionTimes().entrySet()) {
+            if (!first) sb.append(", ");
+            sb.append(e.getKey()).append("=").append(e.getValue());
+            first = false;
+        }
+        sb.append("}\n");
+        return sb.toString();
+    }
+
     public DiskSpaceManager getDiskSpaceManager() {
         return diskSpaceManager;
     }
@@ -1025,11 +1055,13 @@ public class Database implements AutoCloseable {
         private long transNum;
         private boolean recoveryTransaction;
         private TransactionContext transactionContext;
+        private long startTime;
 
         private TransactionImpl(long transNum, boolean recovery) {
             this.transNum = transNum;
             this.recoveryTransaction = recovery;
             this.transactionContext = new TransactionContextImpl(transNum, recovery);
+            this.startTime = System.currentTimeMillis();
         }
 
         @Override
@@ -1078,6 +1110,10 @@ public class Database implements AutoCloseable {
         @Override
         public long getTransNum() {
             return transNum;
+        }
+
+        public long getStartTime() {
+            return startTime;
         }
 
         @Override
