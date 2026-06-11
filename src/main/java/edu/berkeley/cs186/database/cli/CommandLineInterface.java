@@ -197,6 +197,14 @@ public class CommandLineInterface {
         } else if (cmd.equals("alllocks")) {
             // Show all locks across ALL transactions (for DDA debugging)
             this.out.println(db.getLockManager().getAllLockInfo());
+        } else if (cmd.equals("kill")) {
+            if (tokens.length < 2) {
+                this.out.println("Usage: \\kill <transNum>");
+                return;
+            }
+            long transNum = Long.parseLong(tokens[1]);
+            db.rollbackTransaction(transNum);
+            this.out.println("Transaction " + transNum + " rolled back.");
         } else {
             throw new IllegalArgumentException(String.format(
                 "`%s` is not a valid metacommand",
