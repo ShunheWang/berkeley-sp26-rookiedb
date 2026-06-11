@@ -92,6 +92,8 @@ public class Database implements AutoCloseable {
     private Table indexMetadata;
     // number of transactions created
     private long numTransactions;
+    // transaction registry for cross-connection rollback (DDA \kill)
+    private Map<Long, TransactionImpl> transactionRegistry = new ConcurrentHashMap<>();
 
     // lock manager
     private final LockManager lockManager;
@@ -584,6 +586,7 @@ public class Database implements AutoCloseable {
         this.recoveryManager.startTransaction(t);
         ++this.numTransactions;
         TransactionContext.setTransaction(t.getTransactionContext());
+        transactionRegistry.put(t.getTransNum(), t);
         return t;
     }
 
@@ -1038,6 +1041,7 @@ public class Database implements AutoCloseable {
 
             transactionContext.close();
             activeTransactions.arriveAndDeregister();
+            transactionRegistry.remove(this.transNum);
         }
 
         @Override
