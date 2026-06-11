@@ -93,7 +93,7 @@ public class Database implements AutoCloseable {
     // number of transactions created
     private long numTransactions;
     // transaction registry for cross-connection rollback (DDA \kill)
-    private Map<Long, TransactionImpl> transactionRegistry = new ConcurrentHashMap<>();
+    Map<Long, TransactionImpl> transactionRegistry = new ConcurrentHashMap<>();
 
     // lock manager
     private final LockManager lockManager;
