@@ -412,6 +412,23 @@ public class LockManager {
     }
 
     /**
+     * Remove all lock requests for a given transaction from all resource
+     * waiting queues. Used when DDA kills a transaction from another
+     * connection — normal rollback releases held locks but doesn't
+     * clean up pending queue entries.
+     *
+     * This method is synchronized to be mutually exclusive with
+     * acquire/release/promote.
+     */
+    public synchronized void removeFromAllQueues(long transNum) {
+        for (ResourceEntry entry : resourceEntries.values()) {
+            entry.waitingQueue.removeIf(
+                req -> req.transaction.getTransNum() == transNum
+            );
+        }
+    }
+
+    /**
      * Return the type of lock `transaction` has on `name` or NL if no lock is
      * held.
      */
