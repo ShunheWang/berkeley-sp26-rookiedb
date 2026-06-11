@@ -76,6 +76,17 @@ public abstract class TransactionContext implements AutoCloseable {
         threadTransactions.remove(threadId);
     }
 
+    /**
+     * Unset a transaction by transNum rather than by current thread.
+     * Used for cross-connection rollback (DDA \kill), where the
+     * rollback executes on the DDA thread, not the victim's thread.
+     */
+    public static void unsetTransaction(long transNum) {
+        threadTransactions.entrySet().removeIf(
+            e -> e.getValue().getTransNum() == transNum
+        );
+    }
+
     // Status //////////////////////////////////////////////////////////////////
 
     /**

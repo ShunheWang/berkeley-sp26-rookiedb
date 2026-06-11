@@ -954,7 +954,7 @@ public class Database implements AutoCloseable {
                 throw e;
             } finally {
                 if (!this.recoveryTransaction) {
-                    TransactionContext.unsetTransaction();
+                    TransactionContext.unsetTransaction(this.getTransNum());
                 }
             }
         }
