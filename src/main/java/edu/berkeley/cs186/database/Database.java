@@ -608,6 +608,37 @@ public class Database implements AutoCloseable {
         return t;
     }
 
+    /**
+     * Rollback a transaction from a different connection.
+     * Used by DDA for cross-connection victim rollback (\kill).
+     *
+     * Execution order:
+     * 1. Remove victim from all lock waiting queues
+     * 2. Rollback via normal ARIES path (abort -> end -> release locks)
+     * 3. Unblock victim thread if it was waiting in TransactionContext.block()
+     *
+     * @param transNum transaction number to rollback
+     * @throws IllegalArgumentException if transaction not found
+     */
+    public void rollbackTransaction(long transNum) {
+        TransactionImpl t = transactionRegistry.get(transNum);
+        if (t == null) {
+            throw new IllegalArgumentException(
+                "Transaction " + transNum + " not found in registry");
+        }
+
+        TransactionContext ctx = t.getTransactionContext();
+
+        // 1. Clean up pending lock requests from all queues
+        lockManager.removeFromAllQueues(transNum);
+
+        // 2. Rollback via normal ARIES path
+        t.rollback();
+
+        // 3. Wake the victim thread if blocked
+        ctx.unblock();
+    }
+
     private class TransactionContextImpl extends TransactionContext {
         long transNum;
         Map<String, String> aliases;
